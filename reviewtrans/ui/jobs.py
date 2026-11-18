@@ -91,6 +91,7 @@ class Job:
     finished_at: float = 0.0
     logs: list[str] = field(default_factory=list)
     retry_from: str = ""
+    force_asr: bool = False
     retry_translate_profile: str = ""
 
     @property
@@ -127,6 +128,7 @@ class _JobThread(QtCore.QThread):
                 stop_event=self.stop_event,
             )
             pipeline = VideoPipeline(ctx, job.video_id)
+            pipeline.force_asr = job.force_asr
             if job.retry_translate_profile:
                 profile = ctx.settings.find_translate(job.retry_translate_profile)
                 if profile is None:

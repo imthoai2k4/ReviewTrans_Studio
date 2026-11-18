@@ -27,6 +27,7 @@ class VideoPipeline:
 
     def __init__(self, ctx: RunContext, video_id: str) -> None:
         self.ctx = ctx
+        self.force_asr = False
         self.video_id = video_id
         self.doc: VideoDoc = ctx.store.load_video(video_id)
         self.segments: list[Segment] = ctx.store.load_segments(video_id)
@@ -48,10 +49,15 @@ class VideoPipeline:
         self, steps: list[str], only_missing: bool = True, force_context: bool = False, *, start_at: str = "",
     ) -> None:
         ctx = self.ctx
-        ensure_media_info(self.doc)
         steps = ordered_steps(steps)
         if start_at:
             steps = steps[steps.index(start_at):]
+        if "asr" in steps and self.segments and not self.force_asr:
+            ctx.log(f"{self.doc.name}: giữ {len(self.segments)} câu hiện có, bỏ qua nhận dạng.")
+            steps.remove("asr")
+        if not steps:
+            return
+        ensure_media_info(self.doc)
         for step in steps:
             ctx.check_stop()
             if step == "context" and not (ctx.project.context_auto_update or force_context):
@@ -83,6 +89,8 @@ class VideoPipeline:
         ctx = self.ctx
         if step == "asr":
             segments = run_asr(ctx, self.doc)
+            if self.segments and not segments:
+                raise ValueError("Nhận dạng không trả về câu nào. Đã giữ lại phụ đề hiện có.")
             self.segments = segments
             self.doc.mark_stale_from("translate")
         elif step == "translate":

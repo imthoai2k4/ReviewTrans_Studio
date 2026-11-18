@@ -9,6 +9,7 @@ from ...core.config import LLM_KINDS
 from ...core.langs import SOURCE_LANGUAGES, TARGET_LANGUAGES, display_name
 from ...core.models import STAGE_LABELS, STAGES, Character, GlossaryEntry, ProjectContext
 from ...core.pipeline.resources import KNOWN_WHISPER_MODELS, downloaded_whisper_models
+from ...core.pipeline import RunContext
 from ...core.pipeline.runner import STEP_LABELS
 from ...core.proc import probe
 from ...core.srt import format_clock
@@ -17,6 +18,7 @@ from ..icons import icon
 from ..jobs import run_background
 from ..state import AppState
 from ..theme import STATE_COLORS, TEXT_DIM
+from ..widgets.run_preview import confirm_run
 from ..widgets.provider_field import ProviderField
 from ..widgets.common import (
     VIDEO_FILTER,
@@ -149,6 +151,7 @@ class VideosTab(QtWidgets.QWidget):
         tools.addWidget(tool_button("down", "Xuống (tập sau)", lambda: self.move(1)))
         tools.addWidget(tool_button("delete", "Xoá khỏi project", self.remove))
         tools.addWidget(push_button("Mở trong Editor", self.open_editor, "editor"))
+        tools.addWidget(push_button("Nhận dạng lại…", self.recognize_again, "mic"))
         tools.addStretch()
         layout.addLayout(tools)
         self.table = QtWidgets.QTableWidget(0, 4 + len(STAGES))
@@ -296,6 +299,29 @@ class VideosTab(QtWidgets.QWidget):
             self.state.openVideoRequested.emit(ids[0])
             self.state.navigateRequested.emit("editor")
 
+    def recognize_again(self) -> None:
+        project, store = self.state.project, self.state.store
+        ids = self.selected_ids()
+        if not project or not store or not ids:
+            error(self, "Chọn video cần nhận dạng lại.")
+            return
+        if any(self.state.is_video_locked(vid) for vid in ids):
+            error(self, "Có video đã chọn đang trong hàng đợi.")
+            return
+        selected = set(ids)
+        names = [ref.name for ref in project.videos if ref.id in selected]
+        detail = ", ".join(names[:5]) + ("…" if len(names) > 5 else "")
+        if not confirm(self, "Nhận dạng lại", f"Nhận dạng lại {len(ids)} video ({detail})?\n"
+                       "Danh sách câu hiện tại, kể cả câu đã sửa, bản dịch và liên kết lồng tiếng, sẽ được thay thế."):
+            return
+        if self.state.store is not store or self.state.project is not project:
+            return
+        if any(self.state.is_video_locked(v) for v in ids):
+            error(self, "Có video đã chọn vừa được thêm vào hàng đợi.")
+            return
+        self.state.enqueue(ids, ["asr"], force_asr=True)
+        self.state.navigateRequested.emit("queue")
+
     def run(self, selected: bool) -> None:
         project = self.state.project
         if not project:
@@ -305,7 +331,17 @@ class VideosTab(QtWidgets.QWidget):
         if not ids or not steps:
             error(self, "Chọn ít nhất một video và một bước.")
             return
-        self.state.enqueue(ids, steps, only_missing=self.only_missing.isChecked())
+        store = self.state.store
+        if store is None:
+            return
+        self.state.flushRequested.emit()
+        ctx = RunContext(store, project, self.state.settings)
+        only_missing = self.only_missing.isChecked()
+        if not confirm_run(self, ctx, ids, steps, only_missing):
+            return
+        if self.state.store is not store or self.state.project is not project:
+            return
+        self.state.enqueue(ids, steps, only_missing=only_missing)
         self.state.navigateRequested.emit("queue")
 
     def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:  # noqa: N802

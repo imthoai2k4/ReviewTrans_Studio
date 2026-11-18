@@ -86,7 +86,10 @@ class AppState(QtCore.QObject):
 
     # ------------------------------------------------------------ jobs
 
-    def enqueue(self, video_ids: list[str], steps: list[str], only_missing: bool = True, force_context: bool = False) -> list[Job]:
+    def enqueue(
+        self, video_ids: list[str], steps: list[str], only_missing: bool = True, force_context: bool = False,
+        *, force_asr: bool = False,
+    ) -> list[Job]:
         if not (self.store and self.project):
             return []
         self.flushRequested.emit()
@@ -102,6 +105,7 @@ class AppState(QtCore.QObject):
                 video_name=names.get(video_id, video_id),
                 steps=list(steps),
                 only_missing=only_missing,
+                force_asr=force_asr,
                 force_context=force_context,
             )
             added.append(self.jobs.add(job))
