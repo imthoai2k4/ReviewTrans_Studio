@@ -15,6 +15,13 @@ PIPELINE_ORDER = ["asr", "translate", "context", "tts", "mix", "render"]
 STEP_LABELS = {**STAGE_LABELS, "context": "Cập nhật ngữ cảnh"}
 
 
+def ordered_steps(steps: list[str]) -> list[str]:
+    requested = set(steps)
+    if "render" in requested:
+        requested.add("mix")
+    return [step for step in PIPELINE_ORDER if step in requested]
+
+
 class VideoPipeline:
     """Chạy các bước cho một video, lưu kết quả sau mỗi bước."""
 
@@ -37,12 +44,14 @@ class VideoPipeline:
 
     # ------------------------------------------------------------ run
 
-    def run(self, steps: list[str], only_missing: bool = True, force_context: bool = False) -> None:
+    def run(
+        self, steps: list[str], only_missing: bool = True, force_context: bool = False, *, start_at: str = "",
+    ) -> None:
         ctx = self.ctx
         ensure_media_info(self.doc)
-        steps = [s for s in PIPELINE_ORDER if s in steps]
-        if "render" in steps and "mix" not in steps:
-            steps.insert(steps.index("render"), "mix")
+        steps = ordered_steps(steps)
+        if start_at:
+            steps = steps[steps.index(start_at):]
         for step in steps:
             ctx.check_stop()
             if step == "context" and not (ctx.project.context_auto_update or force_context):

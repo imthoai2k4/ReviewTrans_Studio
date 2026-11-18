@@ -11,7 +11,7 @@ from PyQt6 import QtCore
 
 from ..core.config import SettingsStore
 from ..core.pipeline import RunContext
-from ..core.pipeline.runner import STEP_LABELS, VideoPipeline
+from ..core.pipeline.runner import STEP_LABELS, VideoPipeline, ordered_steps
 from ..core.proc import StopRequested
 from ..core.store import ProjectStore
 
@@ -90,10 +90,12 @@ class Job:
     started_at: float = 0.0
     finished_at: float = 0.0
     logs: list[str] = field(default_factory=list)
+    retry_from: str = ""
+    retry_translate_profile: str = ""
 
     @property
     def steps_label(self) -> str:
-        return " → ".join(STEP_LABELS.get(s, s) for s in self.steps)
+        return " → ".join(STEP_LABELS[s] for s in ordered_steps(self.steps))
 
     def elapsed(self) -> float:
         if not self.started_at:
@@ -125,27 +127,43 @@ class _JobThread(QtCore.QThread):
                 stop_event=self.stop_event,
             )
             pipeline = VideoPipeline(ctx, job.video_id)
-            original_progress = ctx.progress
-            total = len(job.steps)
+            if job.retry_translate_profile:
+                profile = ctx.settings.find_translate(job.retry_translate_profile)
+                if profile is None:
+                    raise ValueError("API dịch được chọn không còn trong cấu hình.")
+                pipeline.doc.translate_profile = profile.id
+                pipeline.doc.translate_model = ""
+                pipeline.save()
+                queue._log(job, f"Dùng API dịch {profile.name} cho phần còn lại của video.")
+            steps = ordered_steps(job.steps)
+            steps_by_label = {STEP_LABELS[step]: step for step in steps}
+            last_progress_step = None
 
             def step_progress(pct: float, msg: str) -> None:
+                nonlocal last_progress_step
                 # quy đổi tiến độ từng bước ra tiến độ tổng của job
-                current = job.step if job.step in job.steps else ""
-                index = job.steps.index(current) if current else 0
-                original_progress((index + pct / 100.0) * 100.0 / max(1, total), msg)
+                current = job.step if job.step in steps else ""
+                index = steps.index(current) if current else 0
+                queue._progress(
+                    job, (index + pct / 100.0) * 100.0 / max(1, len(steps)), msg,
+                    force=current != last_progress_step,
+                )
+                last_progress_step = current
 
             ctx.progress = step_progress
             original_log = ctx.log
 
             def log_and_track(text: str) -> None:
                 if text.startswith("── "):
-                    for step in job.steps:
-                        if text.endswith(STEP_LABELS.get(step, step)):
-                            job.step = step
+                    step = steps_by_label.get(text.rsplit(": ", 1)[-1])
+                    if step:
+                        job.step = step
                 original_log(text)
 
             ctx.log = log_and_track
-            pipeline.run(job.steps, only_missing=job.only_missing, force_context=job.force_context)
+            pipeline.run(
+                steps, only_missing=job.only_missing, force_context=job.force_context, start_at=job.retry_from,
+            )
             queue._finish(job, DONE)
         except StopRequested:
             queue._finish(job, STOPPED)
@@ -214,7 +232,32 @@ class JobQueue(QtCore.QObject):
     def clear_finished(self) -> None:
         self.jobs = [j for j in self.jobs if j.state in (PENDING, RUNNING)]
 
-    def retry(self, job: Job) -> Job:
+    def can_retry_failed(self, job: Job) -> bool:
+        return (
+            job.state == ERROR and job is not self.current() and job in self.jobs
+            and not self.is_locked(job.project_root, job.video_id)
+        )
+
+    def retry_failed(self, job: Job, translate_profile: str = "") -> Job | None:
+        if not self.can_retry_failed(job) or (translate_profile and job.step != "translate"):
+            return None
+        job.retry_from = job.step
+        job.retry_translate_profile = translate_profile
+        label = STEP_LABELS.get(job.step, "bước đầu tiên")
+        job.error = ""
+        job.finished_at = 0.0
+        job.started_at = 0.0
+        job.message = f"Chờ tiếp tục: {label}"
+        job.state = PENDING
+        self._log(job, f"Đã xếp lại hàng đợi từ {label}.")
+        self.jobChanged.emit(job)
+        self.videoLocksChanged.emit()
+        self._start_next()
+        return job
+
+    def retry(self, job: Job) -> Job | None:
+        if job.state == ERROR:
+            return self.retry_failed(job)
         return self.add(Job(
             project_root=job.project_root, project_name=job.project_name, video_id=job.video_id,
             video_name=job.video_name, steps=list(job.steps), only_missing=job.only_missing,
@@ -257,11 +300,11 @@ class JobQueue(QtCore.QObject):
             del job.logs[:1000]
         self.jobLog.emit(job, line)
 
-    def _progress(self, job: Job, pct: float, message: str) -> None:
+    def _progress(self, job: Job, pct: float, message: str, force: bool = False) -> None:
         job.progress = max(0.0, min(100.0, pct))
         job.message = message
         now = time.time()
-        if now - self._last_emit > 0.15 or pct >= 100:
+        if force or now - self._last_emit > 0.15 or pct >= 100:
             self._last_emit = now
             self.jobChanged.emit(job)
 

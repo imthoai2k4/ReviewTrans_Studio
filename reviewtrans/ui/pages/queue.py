@@ -4,10 +4,13 @@ import time
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 
+from ...core.pipeline.runner import STEP_LABELS
+from ...core.resolve import resolve
 from ..jobs import CANCELLED, DONE, ERROR, JOB_STATE_LABELS, PENDING, RUNNING, STOPPED, Job
 from ..state import AppState
 from ..theme import ACCENT, DANGER, SUCCESS, TEXT_DIM, WARNING
-from ..widgets.common import LogView, push_button, title_label
+from ..widgets.common import LogView, info, push_button, title_label
+from ..widgets.queue_run import QueueRunDialog
 
 COLORS = {PENDING: TEXT_DIM, RUNNING: ACCENT, DONE: SUCCESS, ERROR: DANGER, STOPPED: WARNING, CANCELLED: TEXT_DIM}
 
@@ -26,9 +29,20 @@ class QueuePage(QtWidgets.QWidget):
         header.addWidget(push_button("Xoá việc đã xong", self._clear, "refresh"))
         layout.addLayout(header)
 
+        launch = QtWidgets.QHBoxLayout()
+        self.run_selected_button = push_button("Chạy video đã chọn…", lambda: self._run_project(False), "run")
+        self.run_all_button = push_button("Chạy tất cả video…", lambda: self._run_project(True), "run", "Primary")
+        for button in (self.run_selected_button, self.run_all_button):
+            launch.addWidget(button)
+        launch.addStretch()
+        layout.addLayout(launch)
+        state.projectOpened.connect(self._update_run_buttons)
+        state.projectChanged.connect(self._update_run_buttons)
+        self._update_run_buttons()
+
         splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
-        self.table = QtWidgets.QTableWidget(0, 7)
-        self.table.setHorizontalHeaderLabels(["#", "Project", "Video", "Các bước", "Trạng thái", "Tiến độ", "Thời gian"])
+        self.table = QtWidgets.QTableWidget(0, 8)
+        self.table.setHorizontalHeaderLabels(["#", "Project", "Video", "Các bước", "Trạng thái", "Tiến độ", "Thời gian", "Thao tác"])
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
@@ -38,6 +52,7 @@ class QueuePage(QtWidgets.QWidget):
         header_view.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Stretch)
         self.table.setColumnWidth(0, 40)
         self.table.setColumnWidth(5, 220)
+        self.table.setColumnWidth(7, 183)
         self.table.itemSelectionChanged.connect(self._show_log)
         self.table.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._menu)
@@ -59,6 +74,9 @@ class QueuePage(QtWidgets.QWidget):
         self.queue.jobAdded.connect(self._add_job)
         self.queue.jobChanged.connect(self._update_job)
         self.queue.jobLog.connect(self._on_log)
+        self.queue.videoLocksChanged.connect(self._update_recovery_actions)
+        for job in self.queue.jobs:
+            self._add_job(job)
         self.timer = QtCore.QTimer(self, interval=1000, timeout=self._tick)
         self.timer.start()
 
@@ -66,7 +84,7 @@ class QueuePage(QtWidgets.QWidget):
         row = self.table.rowCount()
         self.table.insertRow(row)
         self.rows[job.id] = row
-        for col, text in enumerate([str(job.id), job.project_name, job.video_name, job.steps_label, "", "", ""]):
+        for col, text in enumerate([str(job.id), job.project_name, job.video_name, job.steps_label, "", "", "", ""]):
             item = QtWidgets.QTableWidgetItem(text)
             item.setData(QtCore.Qt.ItemDataRole.UserRole, job.id)
             self.table.setItem(row, col, item)
@@ -83,13 +101,110 @@ class QueuePage(QtWidgets.QWidget):
         if row is None:
             return
         state_item = self.table.item(row, 4)
-        state_item.setText(JOB_STATE_LABELS.get(job.state, job.state))
+        state_text = JOB_STATE_LABELS.get(job.state, job.state)
+        if job.state == ERROR and job.step:
+            state_text += f" · {STEP_LABELS[job.step]}"
+        state_item.setText(state_text)
         state_item.setForeground(QtGui.QColor(COLORS.get(job.state, TEXT_DIM)))
         state_item.setToolTip(job.error)
         bar = self.bars[job.id]
         bar.setValue(int(job.progress * 10))
         bar.setFormat(f"{job.progress:.0f}% {job.message[:40]}")
         self.table.item(row, 6).setText(self._elapsed(job))
+        self._update_recovery_action(job)
+
+    def _update_run_buttons(self) -> None:
+        has_videos = bool(self.state.project and self.state.project.videos)
+        for button in (self.run_selected_button, self.run_all_button):
+            button.setEnabled(has_videos)
+            button.setToolTip("Chọn từ video của project đang mở." if has_videos else "Mở project có video để chạy.")
+
+    def _run_project(self, all_videos: bool) -> None:
+        project, store = self.state.project, self.state.store
+        if not (project and store):
+            return
+        root = str(store.root)
+        selected = self._selected_job()
+        selected_ids = {selected.video_id} if selected and selected.project_root == root else set()
+        latest = {job.video_id: job for job in self.queue.jobs if job.project_root == root}
+        failed = {vid: job for vid, job in latest.items() if self.queue.can_retry_failed(job)}
+        videos = [video for video in project.videos if not self.state.is_video_locked(video.id)]
+        if not videos:
+            info(self, "Các video của project đã có trong hàng đợi.")
+            return
+        dialog = QueueRunDialog(project.name, videos, selected_ids, failed, all_videos, self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        if self.state.store is not store:
+            return
+
+        steps, only_missing = dialog.steps(), dialog.only_missing.isChecked()
+        for video_id in dialog.video_ids():
+            if self.state.is_video_locked(video_id):
+                continue
+            job = failed.get(video_id)
+            if job is not None:
+                self._retry_failed(job)
+            else:
+                video_steps = steps
+                if only_missing and "asr" in steps and store.load_segments(video_id):
+                    video_steps = [step for step in steps if step != "asr"]
+                if video_steps:
+                    self.state.enqueue([video_id], video_steps, only_missing=only_missing)
+
+    def _update_recovery_actions(self) -> None:
+        for job in self.queue.jobs:
+            if job.state == ERROR:
+                self._update_recovery_action(job)
+
+    def _update_recovery_action(self, job: Job) -> None:
+        row = self.rows.get(job.id)
+        if row is None:
+            return
+        col = self.table.columnCount() - 1
+        button = self.table.cellWidget(row, col)
+        if job.state != ERROR:
+            if button is not None:
+                self.table.removeCellWidget(row, col)
+            return
+        if button is None:
+            button = QtWidgets.QToolButton()
+            button.setText("Tiếp tục từ bước lỗi" if job.step else "Thử lại")
+            button.clicked.connect(lambda: self._retry_failed(job))
+            if job.step == "translate":
+                menu = QtWidgets.QMenu(button)
+                menu.addAction("Đổi API và dịch tiếp…", lambda: self._change_api_and_retry(job))
+                button.setMenu(menu)
+                button.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+            self.table.setCellWidget(row, col, button)
+        button.setToolTip(job.error)
+        button.setEnabled(self.queue.can_retry_failed(job))
+
+    def _retry_failed(self, job: Job, profile_id: str = "") -> None:
+        if self.state.store and str(self.state.store.root) == job.project_root:
+            self.state.flushRequested.emit()
+            self.state.save_project()
+        self.queue.retry_failed(job, profile_id)
+
+    def _change_api_and_retry(self, job: Job) -> None:
+        if not self.queue.can_retry_failed(job):
+            return
+        store = self.state.store if self.state.store and str(self.state.store.root) == job.project_root else None
+        if store:
+            doc = store.load_video(job.video_id)
+            current = resolve(self.state.settings, "translate", self.state.project, doc).profile
+        else:
+            current = None
+        choices = [profile for profile in self.state.settings.translate_profiles if profile != current]
+        if not choices:
+            info(self, "Thêm một cấu hình dịch khác ở trang API rồi thử lại.")
+            return
+        names = [f"{i}. {profile.name} · {profile.model or profile.kind}" for i, profile in enumerate(choices, 1)]
+        name, ok = QtWidgets.QInputDialog.getItem(
+            self, "Đổi API và dịch tiếp", "API dịch mới cho video này", names, 0, False,
+        )
+        if ok:
+            self._retry_failed(job, choices[names.index(name)].id)
 
     def _tick(self) -> None:
         current = self.queue.current()
@@ -136,7 +251,10 @@ class QueuePage(QtWidgets.QWidget):
         menu = QtWidgets.QMenu(self)
         if job.state in (PENDING, RUNNING):
             menu.addAction("Huỷ / dừng", lambda: self.queue.cancel(job))
-        if job.state in (ERROR, STOPPED, CANCELLED, DONE):
+        if job.state == ERROR:
+            action = menu.addAction("Tiếp tục từ bước lỗi" if job.step else "Thử lại", lambda: self._retry_failed(job))
+            action.setEnabled(self.queue.can_retry_failed(job))
+        if job.state in (STOPPED, CANCELLED, DONE):
             menu.addAction("Chạy lại", lambda: self.queue.retry(job))
         menu.addAction("Chép log", lambda: QtWidgets.QApplication.clipboard().setText("\n".join(job.logs)))
         menu.exec(self.table.viewport().mapToGlobal(pos))
