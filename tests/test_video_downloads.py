@@ -107,6 +107,41 @@ def test_download_reads_validated_http_ranges_in_order(tmp_path, monkeypatch):
     assert requests_seen[1]["If-Range"] == '"original"'
 
 
+def test_browse_mounts_once_when_show_event_reenters(qapp, home, monkeypatch):
+    from PyQt6 import QtCore, QtGui, QtWidgets
+
+    from reviewtrans.core.config import SettingsStore
+    from reviewtrans.ui.pages.video_downloads import VideoDownloadsPage
+    from reviewtrans.ui.state import AppState
+    from reviewtrans.ui.widgets import hongguo_browser
+
+    monkeypatch.setattr(hongguo_browser, "QWebEngineView", None)
+    state = AppState(SettingsStore())
+    page = VideoDownloadsPage(state)
+    add_widget = page._browse_layout.addWidget
+    reentered = False
+
+    def add_with_nested_show(widget, *args):
+        nonlocal reentered
+        if not reentered:
+            reentered = True
+            QtCore.QCoreApplication.sendEvent(page, QtGui.QShowEvent())
+        add_widget(widget, *args)
+
+    monkeypatch.setattr(page._browse_layout, "addWidget", add_with_nested_show)
+    try:
+        page.show()
+        page.hide()
+        page.show()
+        labels = page.tabs.widget(0).findChildren(QtWidgets.QLabel)
+        assert reentered
+        assert sum("PyQt6-WebEngine" in label.text() for label in labels) == 1
+    finally:
+        page.shutdown()
+        page.close()
+        state.jobs.shutdown()
+
+
 def test_download_page_limits_transfers_and_releases_next_item(qapp, home, tmp_path, monkeypatch):
     from PyQt6 import QtCore
 

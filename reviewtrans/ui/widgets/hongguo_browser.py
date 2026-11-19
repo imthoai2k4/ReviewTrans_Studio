@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from PyQt6 import QtCore, QtWidgets
 
-from ...core.video_downloads import HONGGUO_HOME, hongguo_media, is_hongguo, player_url
+from ...core.video_downloads import hongguo_media, is_hongguo, player_url
 
 try:
     from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineSettings
@@ -55,7 +55,7 @@ if QWebEngineView is not None:
 class HongguoBrowser(QtCore.QObject):
     """One visible browser and one short-lived player document per chosen episode."""
 
-    def __init__(self, layout: QtWidgets.QVBoxLayout, parent: QtWidgets.QWidget):
+    def __init__(self, parent: QtWidgets.QWidget):
         super().__init__(parent)
         self.view = None
         self._player = None
@@ -65,6 +65,8 @@ class HongguoBrowser(QtCore.QObject):
         self._sample_timer.timeout.connect(self._sample)
         self._deadline = QtCore.QTimer(self, singleShot=True, interval=18000)
         self._deadline.timeout.connect(lambda: self._complete(None))
+
+    def attach_view(self, layout: QtWidgets.QVBoxLayout) -> None:
         if QWebEngineView is None:
             label = QtWidgets.QLabel("Cần cài PyQt6-WebEngine để mở Hongguo trong ReviewTrans.")
             label.setWordWrap(True)
@@ -72,11 +74,11 @@ class HongguoBrowser(QtCore.QObject):
             layout.addStretch()
             return
 
+        parent = layout.parentWidget()
         self.view = QWebEngineView(parent)
-        layout.addWidget(self.view, 1)
         self._profile = QWebEngineProfile(parent)
         self.view.setPage(_HongguoPage(self._profile, self.view))
-        self.view.setUrl(QtCore.QUrl(HONGGUO_HOME))
+        layout.addWidget(self.view, 1)
 
     def open(self, url: str) -> None:
         if self.view is not None:

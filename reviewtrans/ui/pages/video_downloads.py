@@ -82,14 +82,18 @@ class VideoDownloadsPage(QtWidgets.QWidget):
 
     def _ensure_browser(self) -> HongguoBrowser:
         if self._browser is None:
-            self._browser = HongguoBrowser(self._browse_layout, self.tabs.widget(0))
-            view = self._browser.view
+            browser = HongguoBrowser(self.tabs.widget(0))
+            # Adding the view can dispatch another show event before this call returns.
+            self._browser = browser
+            browser.attach_view(self._browse_layout)
+            view = browser.view
             if view is not None:
                 self._back.clicked.connect(view.back)
                 self._forward.clicked.connect(view.forward)
                 self._reload.clicked.connect(view.reload)
                 view.urlChanged.connect(lambda _url: self._update_browser())
                 view.loadFinished.connect(self._browser_loaded)
+                browser.open(HONGGUO_HOME)
             self._update_browser()
         return self._browser
 
