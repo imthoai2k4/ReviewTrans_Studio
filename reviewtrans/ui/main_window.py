@@ -18,6 +18,7 @@ from .pages.queue import QueuePage
 from .pages.resources import ResourcesPage
 from .pages.settings import SettingsPage
 from .pages.tools import ToolsPage
+from .pages.video_downloads import VideoDownloadsPage
 from .state import AppState
 from .theme import TEXT_DIM
 from .widgets.common import confirm
@@ -30,6 +31,7 @@ NAV = [
     ("presets", "Preset", "presets"),
     ("resources", "Tài nguyên", "resources"),
     ("tools", "Công cụ", "tools"),
+    ("video_downloads", "Tải video", "download"),
     ("settings", "Cài đặt", "settings"),
 ]
 
@@ -53,14 +55,18 @@ class MainWindow(QtWidgets.QMainWindow):
         rail_layout.setContentsMargins(6, 10, 6, 10)
         rail_layout.setSpacing(4)
         self.stack = QtWidgets.QStackedWidget()
+        projects = ProjectsPage(state)
+        self.video_downloads = VideoDownloadsPage(state)
+        self.video_downloads.importRequested.connect(projects.videos.add_paths)
         self.pages: dict[str, QtWidgets.QWidget] = {
-            "projects": ProjectsPage(state),
+            "projects": projects,
             "editor": EditorPage(state),
             "queue": QueuePage(state),
             "providers": ProvidersPage(state),
             "presets": PresetsPage(state),
             "resources": ResourcesPage(state),
             "tools": ToolsPage(state),
+            "video_downloads": self.video_downloads,
             "settings": SettingsPage(state),
         }
         self.buttons: dict[str, QtWidgets.QToolButton] = {}
@@ -161,10 +167,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.restoreGeometry(QtCore.QByteArray.fromBase64(geometry.encode("ascii")))
 
     def closeEvent(self, event) -> None:  # noqa: N802
-        if self.state.jobs.is_busy():
-            if not confirm(self, "Đang xử lý", "Hàng đợi đang chạy. Dừng và thoát?"):
+        if self.state.jobs.is_busy() or self.video_downloads.is_busy():
+            if not confirm(self, "Đang xử lý", "Các tác vụ đang chạy. Dừng và thoát?"):
                 event.ignore()
                 return
+        self.video_downloads.shutdown()
         self.state.flushRequested.emit()
         editor: EditorPage = self.pages["editor"]  # type: ignore[assignment]
         editor.shutdown()

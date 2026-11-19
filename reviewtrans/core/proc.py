@@ -108,12 +108,13 @@ class MediaInfo:
     has_video: bool = False
 
 
-def probe(path: str | Path) -> MediaInfo:
+def probe(path: str | Path, *, local_formats: str = "") -> MediaInfo:
     ffprobe = require_tool("ffprobe")
+    input_options = ["-protocol_whitelist", "file", "-format_whitelist", local_formats] if local_formats else []
     result = subprocess.run(
         [
             str(ffprobe), "-v", "error", "-print_format", "json",
-            "-show_format", "-show_streams", str(path),
+            "-show_format", "-show_streams", *input_options, str(path),
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
