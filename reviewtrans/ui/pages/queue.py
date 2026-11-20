@@ -6,13 +6,16 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 
 from ...core.pipeline.runner import STEP_LABELS
 from ...core.resolve import resolve
-from ..jobs import CANCELLED, DONE, ERROR, JOB_STATE_LABELS, PENDING, RUNNING, STOPPED, Job
+from ..jobs import CANCELLED, DONE, ERROR, JOB_STATE_LABELS, PAUSED, PAUSING, PENDING, RUNNING, STOPPED, Job
 from ..state import AppState
 from ..theme import ACCENT, DANGER, SUCCESS, TEXT_DIM, WARNING
-from ..widgets.common import LogView, info, push_button, title_label
+from ..widgets.common import LogView, hint, info, push_button, title_label
 from ..widgets.queue_run import QueueRunDialog
 
-COLORS = {PENDING: TEXT_DIM, RUNNING: ACCENT, DONE: SUCCESS, ERROR: DANGER, STOPPED: WARNING, CANCELLED: TEXT_DIM}
+COLORS = {
+    PENDING: TEXT_DIM, RUNNING: ACCENT, DONE: SUCCESS, ERROR: DANGER,
+    STOPPED: WARNING, CANCELLED: TEXT_DIM, PAUSING: WARNING, PAUSED: WARNING,
+}
 
 
 class QueuePage(QtWidgets.QWidget):
@@ -24,8 +27,12 @@ class QueuePage(QtWidgets.QWidget):
         layout.setContentsMargins(10, 10, 10, 10)
         header = QtWidgets.QHBoxLayout()
         header.addWidget(title_label("Hàng đợi xử lý", "Các video chạy lần lượt theo thứ tự thêm vào; ngữ cảnh project được cập nhật sau mỗi video."), 1)
-        header.addWidget(push_button("Dừng việc đang chạy", self.queue.stop_current, "stop", "Danger"))
-        header.addWidget(push_button("Huỷ tất cả", self.queue.cancel_all, "delete"))
+        self.stop_button = push_button("Tạm dừng hàng đợi", self.queue.pause, "stop", "Danger")
+        self.stop_button.setToolTip("Dừng video hiện tại và giữ toàn bộ hàng đợi để tiếp tục sau.")
+        self.resume_button = push_button("Tiếp tục", self.queue.resume, "play")
+        self.resume_button.setToolTip("Tiếp tục bước đang dừng, rồi lần lượt xử lý các video còn lại.")
+        header.addWidget(self.stop_button)
+        header.addWidget(self.resume_button)
         header.addWidget(push_button("Xoá việc đã xong", self._clear, "refresh"))
         layout.addLayout(header)
 
@@ -40,22 +47,46 @@ class QueuePage(QtWidgets.QWidget):
         state.projectChanged.connect(self._update_run_buttons)
         self._update_run_buttons()
 
+        tools = QtWidgets.QHBoxLayout()
+        self.select_all_button = push_button("Chọn tất cả", self.select_all)
+        self.clear_selection_button = push_button("Bỏ chọn", self.clear_selection)
+        self.remove_button = push_button("Xoá đã chọn", self._remove_selected, "delete", "Danger")
+        tools.addWidget(self.select_all_button)
+        tools.addWidget(self.clear_selection_button)
+        tools.addWidget(self.remove_button)
+        self.selection_summary = hint("")
+        tools.addWidget(self.selection_summary)
+        tools.addStretch()
+        tools.addWidget(hint("Chỉ xoá khỏi hàng đợi; giữ file video và dữ liệu project."))
+        layout.addLayout(tools)
+
         splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
-        self.table = QtWidgets.QTableWidget(0, 8)
-        self.table.setHorizontalHeaderLabels(["#", "Project", "Video", "Các bước", "Trạng thái", "Tiến độ", "Thời gian", "Thao tác"])
+        self.table = QtWidgets.QTableWidget(0, 9)
+        self.table.setHorizontalHeaderLabels(["Chọn", "#", "Project", "Video", "Các bước", "Trạng thái", "Tiến độ", "Thời gian", "Thao tác"])
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         header_view = self.table.horizontalHeader()
-        header_view.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
         header_view.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Stretch)
-        self.table.setColumnWidth(0, 40)
-        self.table.setColumnWidth(5, 220)
-        self.table.setColumnWidth(7, 183)
+        header_view.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.table.setColumnWidth(0, 55)
+        self.table.setColumnWidth(1, 40)
+        self.table.setColumnWidth(6, 220)
+        self.table.setColumnWidth(8, 183)
         self.table.itemSelectionChanged.connect(self._show_log)
+        self.table.currentCellChanged.connect(lambda *_args: self._show_log())
+        self.table.itemSelectionChanged.connect(self._update_controls)
+        self.table.itemChanged.connect(self._on_check_changed)
         self.table.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._menu)
+        for key, callback in (
+            (QtGui.QKeySequence.StandardKey.SelectAll, self.select_all),
+            (QtGui.QKeySequence.StandardKey.Delete, self._remove_selected),
+        ):
+            shortcut = QtGui.QShortcut(QtGui.QKeySequence(key), self.table)
+            shortcut.setContext(QtCore.Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(callback)
         splitter.addWidget(self.table)
         log_box = QtWidgets.QWidget()
         log_layout = QtWidgets.QVBoxLayout(log_box)
@@ -72,35 +103,64 @@ class QueuePage(QtWidgets.QWidget):
         self.rows: dict[int, int] = {}
         self.bars: dict[int, QtWidgets.QProgressBar] = {}
         self.queue.jobAdded.connect(self._add_job)
+        self.queue.jobsRemoved.connect(self._remove_rows)
         self.queue.jobChanged.connect(self._update_job)
         self.queue.jobLog.connect(self._on_log)
         self.queue.videoLocksChanged.connect(self._update_recovery_actions)
+        self.queue.pausedChanged.connect(self._update_controls)
+        self.queue.busyChanged.connect(self._update_controls)
         for job in self.queue.jobs:
             self._add_job(job)
+        self._update_controls()
         self.timer = QtCore.QTimer(self, interval=1000, timeout=self._tick)
         self.timer.start()
 
     def _add_job(self, job: Job) -> None:
+        blocker = QtCore.QSignalBlocker(self.table)
         row = self.table.rowCount()
         self.table.insertRow(row)
         self.rows[job.id] = row
-        for col, text in enumerate([str(job.id), job.project_name, job.video_name, job.steps_label, "", "", "", ""]):
+        for col, text in enumerate(["", str(job.id), job.project_name, job.video_name, job.steps_label, "", "", "", ""]):
             item = QtWidgets.QTableWidgetItem(text)
             item.setData(QtCore.Qt.ItemDataRole.UserRole, job.id)
+            if col == 0:
+                item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(QtCore.Qt.CheckState.Unchecked)
             self.table.setItem(row, col, item)
         bar = QtWidgets.QProgressBar()
         bar.setRange(0, 1000)
         self.bars[job.id] = bar
-        self.table.setCellWidget(row, 5, bar)
+        self.table.setCellWidget(row, 6, bar)
+        blocker.unblock()
         self._update_job(job)
         if self.table.currentRow() < 0:
             self.table.selectRow(row)
 
+    def _update_controls(self, *_args) -> None:
+        self.stop_button.setEnabled(
+            not self.queue.is_paused()
+            and any(j.state in (PENDING, RUNNING, PAUSING, PAUSED) for j in self.queue.jobs)
+        )
+        self.resume_button.setEnabled(self.queue.is_paused())
+        selected = self._selected_jobs()
+        blocked = any(not self.queue.can_remove(job) for job in selected)
+        self.remove_button.setEnabled(bool(selected) and not blocked)
+        self.remove_button.setToolTip(
+            "Dừng video đang chạy và chờ dừng hẳn trước khi xoá."
+            if blocked else "Gỡ các video đã chọn khỏi hàng đợi, giữ file video và dữ liệu project."
+        )
+        self.select_all_button.setEnabled(bool(self.queue.jobs))
+        self.clear_selection_button.setEnabled(bool(selected))
+        self.selection_summary.setText(f"Đã chọn {len(selected)}/{len(self.queue.jobs)} video")
+        if blocked:
+            self.selection_summary.setText(self.selection_summary.text() + " · Dừng video đang chạy trước khi xoá")
+
     def _update_job(self, job: Job) -> None:
+        self._update_controls()
         row = self.rows.get(job.id)
         if row is None:
             return
-        state_item = self.table.item(row, 4)
+        state_item = self.table.item(row, 5)
         state_text = JOB_STATE_LABELS.get(job.state, job.state)
         if job.state == ERROR and job.step:
             state_text += f" · {STEP_LABELS[job.step]}"
@@ -110,7 +170,7 @@ class QueuePage(QtWidgets.QWidget):
         bar = self.bars[job.id]
         bar.setValue(int(job.progress * 10))
         bar.setFormat(f"{job.progress:.0f}% {job.message[:40]}")
-        self.table.item(row, 6).setText(self._elapsed(job))
+        self.table.item(row, 7).setText(self._elapsed(job))
         self._update_recovery_action(job)
 
     def _update_run_buttons(self) -> None:
@@ -124,8 +184,7 @@ class QueuePage(QtWidgets.QWidget):
         if not (project and store):
             return
         root = str(store.root)
-        selected = self._selected_job()
-        selected_ids = {selected.video_id} if selected and selected.project_root == root else set()
+        selected_ids = {job.video_id for job in self._selected_jobs() if job.project_root == root}
         latest = {job.video_id: job for job in self.queue.jobs if job.project_root == root}
         failed = {vid: job for vid, job in latest.items() if self.queue.can_retry_failed(job)}
         videos = [video for video in project.videos if not self.state.is_video_locked(video.id)]
@@ -139,6 +198,7 @@ class QueuePage(QtWidgets.QWidget):
             return
 
         steps, only_missing = dialog.steps(), dialog.only_missing.isChecked()
+        batch_settings = project.batch_settings if project.batch_settings and project.batch_settings.enabled else None
         for video_id in dialog.video_ids():
             if self.state.is_video_locked(video_id):
                 continue
@@ -150,7 +210,7 @@ class QueuePage(QtWidgets.QWidget):
                 if only_missing and "asr" in steps and store.load_segments(video_id):
                     video_steps = [step for step in steps if step != "asr"]
                 if video_steps:
-                    self.state.enqueue([video_id], video_steps, only_missing=only_missing)
+                    self.state.enqueue([video_id], video_steps, only_missing=only_missing, batch_settings=batch_settings)
 
     def _update_recovery_actions(self) -> None:
         for job in self.queue.jobs:
@@ -211,61 +271,123 @@ class QueuePage(QtWidgets.QWidget):
         if current:
             row = self.rows.get(current.id)
             if row is not None:
-                self.table.item(row, 6).setText(self._elapsed(current))
+                self.table.item(row, 7).setText(self._elapsed(current))
 
     @staticmethod
     def _elapsed(job: Job) -> str:
         seconds = int(job.elapsed())
         return time.strftime("%H:%M:%S", time.gmtime(seconds)) if seconds else ""
 
+    def _selected_jobs(self) -> list[Job]:
+        checked = {
+            item.data(QtCore.Qt.ItemDataRole.UserRole)
+            for row in range(self.table.rowCount())
+            if (item := self.table.item(row, 0)) and item.checkState() == QtCore.Qt.CheckState.Checked
+        }
+        ids = checked or {
+            self.table.item(index.row(), 0).data(QtCore.Qt.ItemDataRole.UserRole)
+            for index in self.table.selectionModel().selectedRows()
+        }
+        return [job for job in self.queue.jobs if job.id in ids]
+
+    def select_all(self) -> None:
+        blocker = QtCore.QSignalBlocker(self.table)
+        self.table.clearSelection()
+        for row in range(self.table.rowCount()):
+            self.table.item(row, 0).setCheckState(QtCore.Qt.CheckState.Checked)
+        blocker.unblock()
+        self._update_controls()
+        self._show_log()
+
+    def clear_selection(self) -> None:
+        blocker = QtCore.QSignalBlocker(self.table)
+        self.table.clearSelection()
+        for row in range(self.table.rowCount()):
+            self.table.item(row, 0).setCheckState(QtCore.Qt.CheckState.Unchecked)
+        blocker.unblock()
+        self._update_controls()
+        self._show_log()
+
+    def _on_check_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
+        if item.column() == 0:
+            self.table.clearSelection()
+            self._update_controls()
+            self._show_log()
+
     def _selected_job(self) -> Job | None:
-        row = self.table.currentRow()
-        if row < 0:
-            return None
-        item = self.table.item(row, 0)
-        job_id = item.data(QtCore.Qt.ItemDataRole.UserRole) if item else None
-        return next((j for j in self.queue.jobs if j.id == job_id), None)
+        rows = {index.row() for index in self.table.selectionModel().selectedRows()}
+        if rows:
+            row = self.table.currentRow()
+            if row not in rows:
+                row = min(rows)
+            job_id = self.table.item(row, 0).data(QtCore.Qt.ItemDataRole.UserRole)
+            return next((j for j in self.queue.jobs if j.id == job_id), None)
+        selected = self._selected_jobs()
+        item = self.table.item(self.table.currentRow(), 0)
+        current_id = item.data(QtCore.Qt.ItemDataRole.UserRole) if item else None
+        return next((job for job in selected if job.id == current_id), next(iter(selected), None))
 
     def _show_log(self) -> None:
         job = self._selected_job()
         self.log.clear()
+        self.log_title.setText(f"Log — {job.video_name}" if job else "Log")
         if job:
-            self.log_title.setText(f"Log — {job.video_name}")
             self.log.setPlainText("\n".join(job.logs))
             self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
 
     def _on_log(self, job: Job, line: str) -> None:
+        if job.id not in self.rows:
+            return
         selected = self._selected_job()
-        if selected is None or selected.id == job.id:
-            if selected is None:
-                row = self.rows.get(job.id)
-                if row is not None:
-                    self.table.selectRow(row)
-                    return
+        if selected and selected.id == job.id:
             self.log.append_line(line)
 
     def _menu(self, pos) -> None:
-        job = self._selected_job()
+        index = self.table.indexAt(pos)
+        if not index.isValid():
+            return
+        job_id = self.table.item(index.row(), 0).data(QtCore.Qt.ItemDataRole.UserRole)
+        if job_id not in {job.id for job in self._selected_jobs()}:
+            self.clear_selection()
+            self.table.selectRow(index.row())
+        self.table.setCurrentCell(index.row(), index.column(), QtCore.QItemSelectionModel.SelectionFlag.NoUpdate)
+        job = next((job for job in self.queue.jobs if job.id == job_id), None)
         if not job:
             return
         menu = QtWidgets.QMenu(self)
-        if job.state in (PENDING, RUNNING):
-            menu.addAction("Huỷ / dừng", lambda: self.queue.cancel(job))
+        if job.state == PENDING:
+            menu.addAction("Huỷ", lambda: self.queue.cancel(job))
+        if job.state == RUNNING:
+            menu.addAction("Tạm dừng hàng đợi", self.queue.pause)
+        if job.state == PAUSED:
+            menu.addAction("Tiếp tục", self.queue.resume)
         if job.state == ERROR:
             action = menu.addAction("Tiếp tục từ bước lỗi" if job.step else "Thử lại", lambda: self._retry_failed(job))
             action.setEnabled(self.queue.can_retry_failed(job))
         if job.state in (STOPPED, CANCELLED, DONE):
             menu.addAction("Chạy lại", lambda: self.queue.retry(job))
+        remove_action = menu.addAction("Xoá đã chọn khỏi hàng đợi", self._remove_selected)
+        remove_action.setEnabled(self.remove_button.isEnabled())
         menu.addAction("Chép log", lambda: QtWidgets.QApplication.clipboard().setText("\n".join(job.logs)))
         menu.exec(self.table.viewport().mapToGlobal(pos))
 
     def _clear(self) -> None:
         self.queue.clear_finished()
-        keep = {j.id for j in self.queue.jobs}
+
+    def _remove_selected(self) -> None:
+        selected = self._selected_jobs()
+        if selected and all(self.queue.can_remove(job) for job in selected):
+            self.queue.remove([job.id for job in selected])
+
+    def _remove_rows(self, job_ids: list[int]) -> None:
+        removed = set(job_ids)
+        blocker = QtCore.QSignalBlocker(self.table)
         for row in reversed(range(self.table.rowCount())):
             job_id = self.table.item(row, 0).data(QtCore.Qt.ItemDataRole.UserRole)
-            if job_id not in keep:
+            if job_id in removed:
                 self.table.removeRow(row)
                 self.bars.pop(job_id, None)
         self.rows = {self.table.item(r, 0).data(QtCore.Qt.ItemDataRole.UserRole): r for r in range(self.table.rowCount())}
-        self.log.clear()
+        blocker.unblock()
+        self._update_controls()
+        self._show_log()

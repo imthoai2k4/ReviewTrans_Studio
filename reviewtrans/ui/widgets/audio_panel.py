@@ -5,7 +5,7 @@ from PyQt6 import QtCore, QtWidgets
 from ...core.models import AudioSettings, VideoDoc
 from .common import AUDIO_FILTER, ComboBox, DoubleSpinBox, PathEdit, SpinBox, form_layout, hint
 
-ORIGINAL_MODES = [("duck", "Giảm khi có lồng tiếng"), ("keep", "Giữ nguyên"), ("mute", "Tắt hẳn")]
+ORIGINAL_MODES = [("keep", "Âm lượng cố định"), ("duck", "Tự giảm theo TTS (mượt)"), ("mute", "Tắt âm thanh gốc")]
 FIT_MODES = [("fit", "Tăng tốc cho vừa khung câu"), ("natural", "Giữ tốc độ tự nhiên")]
 
 
@@ -23,11 +23,20 @@ class AudioPanel(QtWidgets.QWidget):
         form = form_layout()
         original.setLayout(form)
         self.original_mode = ComboBox(ORIGINAL_MODES)
-        self.original_volume = SpinBox(0, 200, 100, " %")
+        self.original_volume = SpinBox(0, 200, 20, " %")
+        self.original_volume.setToolTip("10% giảm âm gốc 40 dB, 100% bằng bản gốc. Âm lượng TTS được chỉnh riêng.")
         self.duck_volume = SpinBox(0, 100, 20, " %")
+        self.duck_volume.setToolTip("Tỷ lệ còn lại của mức âm lượng video gốc khi có TTS.")
+        self.duck_attack = DoubleSpinBox(0, 3, 0.15, 0.05, 2, " s")
+        self.duck_release = DoubleSpinBox(0, 5, 0.6, 0.1, 2, " s")
         form.addRow("Chế độ", self.original_mode)
-        form.addRow("Âm lượng", self.original_volume)
-        form.addRow("Khi có lồng tiếng", self.duck_volume)
+        form.addRow("Âm lượng video gốc", self.original_volume)
+        form.addRow("Còn lại khi có TTS", self.duck_volume)
+        form.addRow("Giảm dần trong", self.duck_attack)
+        form.addRow("Tăng lại trong", self.duck_release)
+        self.original_form = form
+        self.original_hint = hint("")
+        form.addRow(self.original_hint)
 
         dub = QtWidgets.QGroupBox("Lồng tiếng")
         form = form_layout()
@@ -60,13 +69,27 @@ class AudioPanel(QtWidgets.QWidget):
 
         for widget in (self.original_volume, self.duck_volume, self.dub_volume, self.bgm_volume):
             widget.valueChanged.connect(lambda _v: self._commit(False))
-        for widget in (self.pitch, self.max_speed):
+        for widget in (self.pitch, self.max_speed, self.duck_attack, self.duck_release):
             widget.valueChanged.connect(lambda _v: self._commit(False))
         self.speed.valueChanged.connect(lambda _v: self._commit(True))
         self.original_mode.currentIndexChanged.connect(lambda _i: self._commit(False))
         self.fit_mode.currentIndexChanged.connect(lambda _i: self._commit(False))
         self.use_gap.toggled.connect(lambda _c: self._commit(False))
         self.bgm_path.changed.connect(lambda _p: self._commit(False))
+        self._update_original_controls()
+
+    def _update_original_controls(self) -> None:
+        mode = self.original_mode.value()
+        self.original_volume.setEnabled(mode != "mute")
+        for widget in (self.duck_volume, self.duck_attack, self.duck_release):
+            self.original_form.setRowVisible(widget, mode == "duck")
+        if mode == "mute":
+            text = "Tắt âm thanh video gốc, chỉ phát lồng tiếng và nhạc nền đang bật."
+        elif mode == "duck":
+            text = f"Có TTS: âm gốc còn {self.duck_volume.value()}% của mức đã chỉnh. Hết TTS: tăng dần về {self.original_volume.value()}% trong {self.duck_release.value():g} giây."
+        else:
+            text = f"Giữ âm gốc ở {self.original_volume.value()}% suốt video, kể cả khoảng nghỉ giữa các câu TTS."
+        self.original_hint.setText(text)
 
     def set_document(self, doc: VideoDoc | None) -> None:
         self.doc = doc
@@ -77,6 +100,8 @@ class AudioPanel(QtWidgets.QWidget):
         self.original_mode.set_value(a.original_mode)
         self.original_volume.setValue(a.original_volume)
         self.duck_volume.setValue(a.duck_volume)
+        self.duck_attack.setValue(a.duck_attack)
+        self.duck_release.setValue(a.duck_release)
         self.dub_volume.setValue(a.dub_volume)
         self.speed.setValue(a.speed)
         self.pitch.setValue(a.pitch)
@@ -85,6 +110,7 @@ class AudioPanel(QtWidgets.QWidget):
         self.max_speed.setValue(a.max_speed)
         self.bgm_path.set_value(a.bgm_path)
         self.bgm_volume.setValue(a.bgm_volume)
+        self._update_original_controls()
         self._loading = False
 
     def _commit(self, regenerate: bool) -> None:
@@ -94,6 +120,8 @@ class AudioPanel(QtWidgets.QWidget):
         a.original_mode = self.original_mode.value()
         a.original_volume = self.original_volume.value()
         a.duck_volume = self.duck_volume.value()
+        a.duck_attack = self.duck_attack.value()
+        a.duck_release = self.duck_release.value()
         a.dub_volume = self.dub_volume.value()
         a.speed = self.speed.value()
         a.pitch = self.pitch.value()
@@ -102,4 +130,5 @@ class AudioPanel(QtWidgets.QWidget):
         a.max_speed = self.max_speed.value()
         a.bgm_path = self.bgm_path.value()
         a.bgm_volume = self.bgm_volume.value()
+        self._update_original_controls()
         self.audioChanged.emit(regenerate)

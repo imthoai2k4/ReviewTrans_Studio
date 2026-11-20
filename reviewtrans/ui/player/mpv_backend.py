@@ -6,6 +6,9 @@ from __future__ import annotations
 
 import ctypes
 import locale
+import os
+from collections import deque
+from concurrent.futures import Future
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 
@@ -34,6 +37,8 @@ mpv.MpvRenderParam.TYPES.setdefault("sw_pointer", (20, ctypes.c_void_p))
 
 class MpvPlayerBackend(PlayerBackend):
     name = "libmpv"
+    _commandFinished = QtCore.pyqtSignal(object)
+    _sourceLoaded = QtCore.pyqtSignal(str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -59,33 +64,51 @@ class MpvPlayerBackend(PlayerBackend):
         self._duration = 0.0
         self._paused = True
         self._loaded = False
+        self._media_path: str | None = None
         self._pending_override: str | None = None
         self._override: str | None = None
+        self._commands: deque[tuple[tuple[str, ...], Future | None]] = deque()
+        self._command_running = False
+        self._closed = False
+        self._commandFinished.connect(self._finish_command, QtCore.Qt.ConnectionType.QueuedConnection)
+        self._sourceLoaded.connect(self._after_load, QtCore.Qt.ConnectionType.QueuedConnection)
 
         @self.mpv.property_observer("time-pos")
         def _time(_name, value):
-            if value is not None:
+            if self._media_path is not None and value is not None:
                 self._position = float(value)
                 self.positionChanged.emit(self._position)
 
         @self.mpv.property_observer("duration")
         def _duration(_name, value):
-            if value is not None:
+            if self._media_path is not None and value is not None:
                 self._duration = float(value)
                 self.durationChanged.emit(self._duration)
 
         @self.mpv.property_observer("pause")
         def _pause(_name, value):
-            self._paused = bool(value)
-            self.playingChanged.emit(not self._paused)
+            if self._media_path is not None:
+                self._paused = bool(value)
+                self.playingChanged.emit(not self._paused)
 
         @self.mpv.event_callback("file-loaded")
         def _loaded(_event):
-            self._loaded = True
-            QtCore.QMetaObject.invokeMethod(self, "_after_load", QtCore.Qt.ConnectionType.QueuedConnection)
+            if self._closed or self._media_path is None:
+                return
+            # Đọc path ở luồng sự kiện mpv, tránh gán callback cũ cho video vừa mở.
+            try:
+                path = self.mpv.path
+                if path and not self._closed:
+                    self._sourceLoaded.emit(str(path))
+            except Exception as exc:  # noqa: BLE001
+                if not self._closed:
+                    self.errorOccurred.emit(str(exc))
 
-    @QtCore.pyqtSlot()
-    def _after_load(self) -> None:
+    @QtCore.pyqtSlot(str)
+    def _after_load(self, path: str) -> None:
+        if self._closed or self._media_path is None or os.path.normcase(path) != os.path.normcase(self._media_path):
+            return
+        self._loaded = True
         if self._pending_override is not None or self._override:
             self._apply_override(self._pending_override if self._pending_override is not None else self._override)
 
@@ -112,28 +135,80 @@ class MpvPlayerBackend(PlayerBackend):
 
     # ------------------------------------------------------------ điều khiển
 
+    def _send(self, *command: str, completion: Future | None = None) -> None:
+        if self._closed:
+            if completion is not None:
+                completion.cancel()
+            return
+        self._commands.append((command, completion))
+        self._send_next()
+
+    def _send_next(self) -> None:
+        if self._closed or self._command_running or not self._commands:
+            return
+        command, completion = self._commands.popleft()
+        self._command_running = True
+
+        def finished(result: Future) -> None:
+            failure = result.exception()
+            if completion is not None:
+                if failure is None:
+                    completion.set_result(None)
+                else:
+                    completion.set_exception(failure)
+            if not self._closed:
+                self._commandFinished.emit(failure)
+
+        try:
+            result = self.mpv.command_async(*command)
+        except Exception as exc:  # noqa: BLE001
+            result = Future()
+            result.set_exception(exc)
+        result.add_done_callback(finished)
+
+    @QtCore.pyqtSlot(object)
+    def _finish_command(self, failure: Exception | None) -> None:
+        self._command_running = False
+        if not self._closed:
+            if failure is not None:
+                self.errorOccurred.emit(str(failure))
+            self._send_next()
+
     def load(self, path: str) -> None:
         self._loaded = False
-        self.mpv.pause = True
-        self.mpv.play(path)
+        self._media_path = path
+        self._pending_override = None
+        self._override = None
+        self._send("set", "pause", "yes")
+        self._send("loadfile", path, "replace")
 
-    def unload(self) -> None:
+    def unload(self) -> Future | None:
+        had_media = self._media_path is not None
         self._loaded = False
-        self.mpv.command("stop")
+        self._media_path = None
+        self._pending_override = None
+        self._override = None
+        self._position = self._duration = 0.0
+        self._paused = True
+        self.playingChanged.emit(False)
+        if had_media:
+            released = Future()
+            self._send("stop", completion=released)
+            return released
+        return None
 
     def play(self) -> None:
-        self.mpv.pause = False
+        if self._media_path is not None:
+            self._send("set", "pause", "no")
 
     def pause(self) -> None:
-        self.mpv.pause = True
+        if self._media_path is not None:
+            self._send("set", "pause", "yes")
 
     def seek(self, seconds: float) -> None:
         if not self._loaded:
             return
-        try:
-            self.mpv.seek(max(0.0, seconds), reference="absolute", precision="exact")
-        except SystemError:
-            pass
+        self._send("seek", str(max(0.0, seconds)), "absolute", "exact")
 
     def position(self) -> float:
         return self._position
@@ -166,9 +241,18 @@ class MpvPlayerBackend(PlayerBackend):
             self.errorOccurred.emit(f"Không nạp được âm thanh xem trước: {exc}")
 
     def set_volume(self, volume: int) -> None:
-        self.mpv.volume = max(0, min(100, volume))
+        self._send("set", "volume", str(max(0, min(100, volume))))
 
     def close(self) -> None:
+        self._closed = True
+        while self._commands:
+            _, completion = self._commands.popleft()
+            if completion is not None:
+                completion.cancel()
+        self._loaded = False
+        self._media_path = None
+        self._pending_override = None
+        self._override = None
         try:
             if self.ctx is not None:
                 self.ctx.free()

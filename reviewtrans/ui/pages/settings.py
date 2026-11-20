@@ -3,9 +3,8 @@ from __future__ import annotations
 from PyQt6 import QtCore, QtWidgets
 
 from ...core import hardware
-from ...core.config import whisper_thread_count
+from ...core.config import ASR_ENGINES, DEFAULT_TRANSLATE_BATCH_SIZE, MAX_TRANSLATE_BATCH_SIZE, asr_thread_count
 from ...core.langs import SOURCE_LANGUAGES, TARGET_LANGUAGES, display_name
-from ...core.pipeline.resources import KNOWN_WHISPER_MODELS, downloaded_whisper_models
 from ..jobs import run_background
 from ..state import AppState
 from ..theme import SUCCESS, TEXT_DIM
@@ -40,19 +39,23 @@ class SettingsPage(QtWidgets.QWidget):
         processing = QtWidgets.QGroupBox("Xử lý")
         form = form_layout()
         processing.setLayout(form)
-        self.whisper = ComboBox()
-        self.whisper.setEditable(True)
+        self.asr_engine = ComboBox(ASR_ENGINES)
         self.threads = SpinBox(0, 64, 0)
-        self.threads.setSpecialValueText(f"Tự động ({whisper_thread_count(0)})")
+        self.threads.setSpecialValueText(f"Tự động ({asr_thread_count(0)})")
         self.asr_device = ComboBox(hardware.ASR_DEVICES)
-        self.batch = SpinBox(5, 300, 60, " câu")
-        self.tts_concurrency = SpinBox(1, 16, 3, " luồng")
-        form.addRow("Model Whisper mặc định", self.whisper)
-        form.addRow("Whisper chạy trên", self.asr_device)
-        form.addRow("Số luồng CPU Whisper", self.threads)
+        self.batch = SpinBox(5, MAX_TRANSLATE_BATCH_SIZE, DEFAULT_TRANSLATE_BATCH_SIZE, " câu")
+        self.tts_concurrency = SpinBox(0, 16, 0, " luồng")
+        self.tts_concurrency.setSpecialValueText("0 — Gửi tuần tự")
+        form.addRow("Bộ nhận dạng mặc định", self.asr_engine)
+        form.addRow("Nhận dạng chạy trên", self.asr_device)
+        form.addRow("Số luồng CPU nhận dạng", self.threads)
         form.addRow("Số câu mỗi lần dịch", self.batch)
         form.addRow("Luồng TTS song song", self.tts_concurrency)
         layout.addWidget(processing)
+        layout.addWidget(hint(
+            "Paraformer dành cho tiếng Trung/Anh; tải bộ nhận dạng trong Tài nguyên. "
+            "Paraformer dùng PyTorch CPU/CUDA; tự động ưu tiên CUDA nếu khả dụng."
+        ))
 
         render = QtWidgets.QGroupBox("Xuất video")
         form = form_layout()
@@ -61,13 +64,17 @@ class SettingsPage(QtWidgets.QWidget):
         self.crf = SpinBox(10, 40, 20)
         self.preset = ComboBox(PRESETS)
         self.audio_bitrate = ComboBox([(b, b) for b in ("128k", "160k", "192k", "256k", "320k")])
-        self.hwaccel = QtWidgets.QCheckBox("Giải mã video nguồn bằng GPU (hwaccel auto)")
+        self.hwaccel = QtWidgets.QCheckBox("Thử dùng GPU để giải mã video nguồn")
         form.addRow("Codec", self.codec)
         form.addRow("Chất lượng (CRF/CQ)", self.crf)
         form.addRow("Preset x264/x265 (CPU)", self.preset)
         form.addRow("Bitrate âm thanh", self.audio_bitrate)
         form.addRow("", self.hwaccel)
         layout.addWidget(render)
+        layout.addWidget(hint(
+            "Mặc định CPU giải mã, xử lý lớp hình, phụ đề và âm thanh. "
+            "Chế độ tự động ưu tiên GPU rời để mã hoá video."
+        ))
 
         accel = QtWidgets.QGroupBox("Tăng tốc phần cứng")
         accel_layout = QtWidgets.QVBoxLayout(accel)
@@ -82,8 +89,7 @@ class SettingsPage(QtWidgets.QWidget):
         row.addStretch()
         accel_layout.addLayout(row)
         accel_layout.addWidget(hint(
-            "Mỗi bộ mã hoá GPU được chạy thử thật trước khi dùng. Nếu GPU lỗi khi xuất, ứng dụng tự xuất lại bằng CPU. "
-            "Whisper dùng GPU cần tải bản CUDA (NVIDIA) hoặc Vulkan (AMD/Intel/NVIDIA) ở trang Tài nguyên."
+            "Ứng dụng chạy thử bộ mã hoá GPU trước khi dùng và tự đổi bộ mã hoá nếu xuất thất bại."
         ))
         layout.addWidget(accel)
         layout.addWidget(hint("CRF càng nhỏ chất lượng càng cao (18–23 là hợp lý). Đổi player cần khởi động lại ứng dụng."))
@@ -93,11 +99,10 @@ class SettingsPage(QtWidgets.QWidget):
         outer.addWidget(scroll_wrap(inner))
 
         self.save_timer = QtCore.QTimer(self, singleShot=True, interval=500, timeout=self.commit)
-        for widget in (self.source_lang, self.target_lang, self.player, self.codec, self.preset, self.audio_bitrate, self.asr_device):
+        for widget in (self.source_lang, self.target_lang, self.player, self.codec, self.preset, self.audio_bitrate, self.asr_device, self.asr_engine):
             widget.currentIndexChanged.connect(self.save_timer.start)
         for widget in (self.threads, self.batch, self.tts_concurrency, self.crf):
             widget.valueChanged.connect(self.save_timer.start)
-        self.whisper.currentTextChanged.connect(self.save_timer.start)
         self.hwaccel.toggled.connect(self.save_timer.start)
         self.projects_root.changed.connect(self.save_timer.start)
         self.load()
@@ -139,16 +144,11 @@ class SettingsPage(QtWidgets.QWidget):
             gpus += f"<br><span style='{dim}'>Driver NVIDIA {info.nvidia_driver}, CUDA {info.cuda_version}</span>"
         encoders = ", ".join(f"<b style='color:{SUCCESS}'>{c}</b>" for c in info.encoders) or "không có (dùng CPU)"
         chosen, note = hardware.resolve_encoder(self.state.settings.render.video_codec, info)
-        variants = hardware.whisper_variants()
-        whisper = ", ".join(hardware.VARIANT_NAMES.get(v, v) for v in variants) or "chưa có"
-        asr = hardware.whisper_plan(self.state.settings.asr_device, info)
-        asr_text = " → ".join(hardware.VARIANT_NAMES.get(n, n) for n, _, _ in asr) or "—"
         self.hw_status.setText(
             f"<b>GPU</b><br>{gpus}<br><br>"
             f"<b>Mã hoá video bằng GPU:</b> {encoders}<br>"
             f"<span style='{dim}'>Xuất video sẽ dùng: {chosen.codec}{(' (' + chosen.device + ')') if chosen.device else ''}"
             f"{(' — ' + note) if note and not note.startswith('Tự động') else ''}</span><br><br>"
-            f"<b>Whisper:</b> bản đã có: {whisper}<br><span style='{dim}'>Thứ tự thử: {asr_text}</span>"
         )
 
     def load(self) -> None:
@@ -158,10 +158,8 @@ class SettingsPage(QtWidgets.QWidget):
         self.source_lang.set_value(s.default_source_language)
         self.target_lang.set_value(s.default_target_language)
         self.player.set_value(s.player_backend)
-        models = sorted(set(downloaded_whisper_models() + KNOWN_WHISPER_MODELS))
-        self.whisper.set_items([(m, m) for m in models], keep=False)
-        self.whisper.setEditText(s.default_whisper_model)
-        self.threads.setValue(s.whisper_threads)
+        self.asr_engine.set_value(s.default_asr_engine)
+        self.threads.setValue(s.asr_threads)
         self.asr_device.set_value(s.asr_device)
         self.batch.setValue(s.translate_batch_size)
         self.tts_concurrency.setValue(s.tts_concurrency)
@@ -180,8 +178,8 @@ class SettingsPage(QtWidgets.QWidget):
         s.default_source_language = self.source_lang.value()
         s.default_target_language = self.target_lang.value()
         s.player_backend = self.player.value()
-        s.default_whisper_model = self.whisper.currentText().strip() or "small"
-        s.whisper_threads = self.threads.value()
+        s.default_asr_engine = self.asr_engine.value()
+        s.asr_threads = self.threads.value()
         s.asr_device = self.asr_device.value()
         s.translate_batch_size = self.batch.value()
         s.tts_concurrency = self.tts_concurrency.value()

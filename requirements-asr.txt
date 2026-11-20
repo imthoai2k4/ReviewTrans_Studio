@@ -1,0 +1,4 @@
+# Installed into data/funasr-runtime, separately from the desktop application.
+# Install matching CPU/CUDA torch and torchaudio wheels first (see docs/asr-paraformer.md).
+funasr==1.4.26
+soundfile>=0.12.1

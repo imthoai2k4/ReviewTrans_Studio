@@ -5,10 +5,9 @@ from pathlib import Path
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 
-from ...core.config import LLM_KINDS
+from ...core.config import ASR_ENGINES, LLM_KINDS
 from ...core.langs import SOURCE_LANGUAGES, TARGET_LANGUAGES, display_name
-from ...core.models import STAGE_LABELS, STAGES, Character, GlossaryEntry, ProjectContext
-from ...core.pipeline.resources import KNOWN_WHISPER_MODELS, downloaded_whisper_models
+from ...core.models import STAGE_LABELS, STAGES, BatchSettings, Character, GlossaryEntry, ProjectContext
 from ...core.pipeline import RunContext
 from ...core.pipeline.runner import STEP_LABELS
 from ...core.proc import probe
@@ -18,8 +17,7 @@ from ..icons import icon
 from ..jobs import run_background
 from ..state import AppState
 from ..theme import STATE_COLORS, TEXT_DIM
-from ..widgets.run_preview import confirm_run
-from ..widgets.provider_field import ProviderField
+from ..widgets.batch_settings import BatchSettingsDialog
 from ..widgets.common import (
     VIDEO_FILTER,
     ComboBox,
@@ -34,6 +32,9 @@ from ..widgets.common import (
     title_label,
     tool_button,
 )
+from ..widgets.run_preview import confirm_run
+from ..widgets.provider_field import ProviderField
+from ..widgets.style_editor import POSITIONS
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".ts", ".m4v"}
 STATE_SYMBOL = {"done": "●", "stale": "◐", "error": "✕", "running": "▶", "none": "○"}
@@ -144,29 +145,61 @@ class VideosTab(QtWidgets.QWidget):
         super().__init__(parent)
         self.state = state
         self.setAcceptDrops(True)
+        self._selection_project: Path | None = None
+        self._deleting = False
+        self._removed_ids: set[str] = set()
+        self._video_picker: QtWidgets.QFileDialog | None = None
         layout = QtWidgets.QVBoxLayout(self)
         tools = QtWidgets.QHBoxLayout()
         tools.addWidget(push_button("Thêm video…", self.add_videos, "add", "Primary"))
+        self.select_all_button = push_button("Chọn tất cả", self.select_all)
+        self.clear_selection_button = push_button("Bỏ chọn", self.clear_selection)
+        tools.addWidget(self.select_all_button)
+        tools.addWidget(self.clear_selection_button)
         tools.addWidget(tool_button("up", "Lên (tập trước)", lambda: self.move(-1)))
         tools.addWidget(tool_button("down", "Xuống (tập sau)", lambda: self.move(1)))
-        tools.addWidget(tool_button("delete", "Xoá khỏi project", self.remove))
+        self.remove_button = tool_button("delete", "Xoá các video đã chọn khỏi project", self.remove)
+        tools.addWidget(self.remove_button)
         tools.addWidget(push_button("Mở trong Editor", self.open_editor, "editor"))
         tools.addWidget(push_button("Nhận dạng lại…", self.recognize_again, "mic"))
         tools.addStretch()
+        self.selection_summary = hint("")
+        tools.addWidget(self.selection_summary)
         layout.addLayout(tools)
-        self.table = QtWidgets.QTableWidget(0, 4 + len(STAGES))
-        self.table.setHorizontalHeaderLabels(["#", "Tên video", "Thời lượng", "Câu"] + [STAGE_LABELS[s] for s in STAGES])
+        self.table = QtWidgets.QTableWidget(0, 5 + len(STAGES))
+        self.table.setHorizontalHeaderLabels(["Chọn", "#", "Tên video", "Thời lượng", "Câu"] + [STAGE_LABELS[s] for s in STAGES])
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
-        self.table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
-        self.table.setColumnWidth(0, 40)
-        self.table.doubleClicked.connect(lambda _i: self.open_editor())
+        self.table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.table.setColumnWidth(0, 55)
+        self.table.setColumnWidth(1, 40)
+        self.table.doubleClicked.connect(self._open_row)
+        self.table.itemChanged.connect(self._on_check_changed)
+        self.table.itemSelectionChanged.connect(self._update_selection_summary)
+        shortcut = QtGui.QShortcut(QtGui.QKeySequence.StandardKey.SelectAll, self.table)
+        shortcut.setContext(QtCore.Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        shortcut.activated.connect(self.select_all)
         layout.addWidget(self.table, 1)
+        self.delete_status = hint("")
+        self.delete_status.hide()
+        layout.addWidget(self.delete_status)
         layout.addWidget(hint("Kéo thả file video vào đây để thêm. Thứ tự trong danh sách = thứ tự tập, ngữ cảnh được cập nhật lần lượt theo thứ tự này."))
 
         run_box = QtWidgets.QGroupBox("Chạy hàng loạt")
-        run_layout = QtWidgets.QHBoxLayout(run_box)
+        batch_layout = QtWidgets.QVBoxLayout(run_box)
+        settings_row = QtWidgets.QHBoxLayout()
+        self.batch_enabled = QtWidgets.QCheckBox("Áp dụng cài đặt chung")
+        self.batch_enabled.setToolTip("Dùng chung âm lượng video gốc và kiểu phụ đề khi chạy từ đây.")
+        self.batch_enabled.toggled.connect(self._toggle_batch_settings)
+        settings_row.addWidget(self.batch_enabled)
+        settings_row.addWidget(push_button("Cài đặt chung…", self.edit_batch_settings, "settings"))
+        self.batch_summary = hint("")
+        settings_row.addWidget(self.batch_summary, 1)
+        batch_layout.addLayout(settings_row)
+        run_layout = QtWidgets.QHBoxLayout()
+        batch_layout.addLayout(run_layout)
         self.step_checks: dict[str, QtWidgets.QCheckBox] = {}
         for step in ["asr", "translate", "context", "tts", "mix", "render"]:
             check = QtWidgets.QCheckBox(STEP_LABELS[step])
@@ -187,56 +220,150 @@ class VideosTab(QtWidgets.QWidget):
         state.videoChanged.connect(lambda _vid: self._refresh_timer.start())
         state.jobs.videoLocksChanged.connect(lambda: self._refresh_timer.start())
         self._refresh_timer = QtCore.QTimer(self, singleShot=True, interval=700, timeout=self.refresh)
+        self._update_selection_summary()
 
     def refresh(self) -> None:
-        project, store = self.state.project, self.state.store
-        selected = set(self.selected_ids())
-        self.table.setRowCount(0)
-        if not project or not store:
+        if self._removed_ids:
+            removed, self._removed_ids = self._removed_ids, set()
+            self._remove_table_rows(removed)
             return
-        self.table.setRowCount(len(project.videos))
-        for row, ref in enumerate(project.videos):
-            try:
-                doc = store.load_video(ref.id)
-                count = len(store.load_segments(ref.id))
-            except (OSError, FileNotFoundError):
-                continue
-            cells = [str(row + 1), doc.name, format_clock(doc.duration), str(count)]
-            for col, text in enumerate(cells):
-                item = QtWidgets.QTableWidgetItem(text)
-                item.setData(QtCore.Qt.ItemDataRole.UserRole, ref.id)
-                if col == 1:
-                    item.setToolTip(doc.source_path)
-                self.table.setItem(row, col, item)
-            locked = self.state.is_video_locked(ref.id)
-            for offset, stage in enumerate(STAGES):
-                state = doc.stage(stage)
-                if locked and state not in ("done",):
-                    state = "running" if state == "running" else state
-                item = QtWidgets.QTableWidgetItem(f"{STATE_SYMBOL.get(state, '○')} {self._state_text(state)}")
-                item.setForeground(QtGui.QColor(STATE_COLORS.get(state, TEXT_DIM)))
-                if doc.stage_errors.get(stage):
-                    item.setToolTip(doc.stage_errors[stage])
-                self.table.setItem(row, 4 + offset, item)
-            if ref.id in selected:
-                self.table.selectRow(row)
+        project, store = self.state.project, self.state.store
+        self._refresh_batch_settings()
+        root = store.root if store else None
+        same_project = root == self._selection_project
+        checked = set(self.checked_ids()) if same_project else set()
+        selected = set(self._selected_rows()) if same_project else set()
+        self._selection_project = root
+        self.table.setUpdatesEnabled(False)
+        blocker = QtCore.QSignalBlocker(self.table)
+        try:
+            self.table.setRowCount(0)
+            if project and store:
+                self.table.setRowCount(len(project.videos))
+                for row, ref in enumerate(project.videos):
+                    check = QtWidgets.QTableWidgetItem()
+                    check.setData(QtCore.Qt.ItemDataRole.UserRole, ref.id)
+                    check.setFlags(check.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+                    check.setCheckState(QtCore.Qt.CheckState.Checked if ref.id in checked else QtCore.Qt.CheckState.Unchecked)
+                    self.table.setItem(row, 0, check)
+                    try:
+                        doc = store.load_video(ref.id)
+                        count = len(store.load_segments(ref.id))
+                    except OSError:
+                        self.table.setItem(row, 2, QtWidgets.QTableWidgetItem(ref.name))
+                        continue
+                    cells = [str(row + 1), doc.name, format_clock(doc.duration), str(count)]
+                    for col, text in enumerate(cells, start=1):
+                        item = QtWidgets.QTableWidgetItem(text)
+                        item.setData(QtCore.Qt.ItemDataRole.UserRole, ref.id)
+                        if col == 2:
+                            item.setToolTip(doc.source_path)
+                        self.table.setItem(row, col, item)
+                    for offset, stage in enumerate(STAGES):
+                        state = doc.stage(stage)
+                        item = QtWidgets.QTableWidgetItem(f"{STATE_SYMBOL.get(state, '○')} {self._state_text(state)}")
+                        item.setForeground(QtGui.QColor(STATE_COLORS.get(state, TEXT_DIM)))
+                        if doc.stage_errors.get(stage):
+                            item.setToolTip(doc.stage_errors[stage])
+                        self.table.setItem(row, 5 + offset, item)
+                    if ref.id in selected:
+                        self.table.selectionModel().select(
+                            self.table.model().index(row, 0),
+                            QtCore.QItemSelectionModel.SelectionFlag.Select | QtCore.QItemSelectionModel.SelectionFlag.Rows,
+                        )
+        finally:
+            blocker.unblock()
+            self.table.setUpdatesEnabled(True)
+        self._update_selection_summary()
+
+    def _remove_table_rows(self, removed: set[str]) -> None:
+        # Giữ dữ liệu các hàng còn lại, kể cả phụ đề dài đã đọc từ đĩa.
+        with QtCore.QSignalBlocker(self.table):
+            end = self.table.rowCount()
+            for row in range(end - 1, -2, -1):
+                if row >= 0 and self.table.item(row, 0).data(QtCore.Qt.ItemDataRole.UserRole) in removed:
+                    continue
+                if end > row + 1:
+                    self.table.model().removeRows(row + 1, end - row - 1)
+                end = row
+            for row in range(self.table.rowCount()):
+                number = self.table.item(row, 1)
+                if number is not None:
+                    number.setText(str(row + 1))
+        self._update_selection_summary()
 
     @staticmethod
     def _state_text(state: str) -> str:
         return {"done": "xong", "stale": "cũ", "error": "lỗi", "running": "đang chạy", "none": "—"}.get(state, state)
 
-    def selected_ids(self) -> list[str]:
+    def _selected_rows(self) -> list[str]:
         ids = []
-        for index in self.table.selectionModel().selectedRows() if self.table.selectionModel() else []:
+        for index in sorted(self.table.selectionModel().selectedRows(), key=lambda index: index.row()):
             item = self.table.item(index.row(), 0)
             if item:
                 ids.append(item.data(QtCore.Qt.ItemDataRole.UserRole))
         return ids
 
+    def checked_ids(self) -> list[str]:
+        return [
+            item.data(QtCore.Qt.ItemDataRole.UserRole)
+            for row in range(self.table.rowCount())
+            if (item := self.table.item(row, 0)) and item.checkState() == QtCore.Qt.CheckState.Checked
+        ]
+
+    def selected_ids(self) -> list[str]:
+        return self.checked_ids() or self._selected_rows()
+
+    def select_all(self) -> None:
+        blocker = QtCore.QSignalBlocker(self.table)
+        self.table.clearSelection()
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item:
+                item.setCheckState(QtCore.Qt.CheckState.Checked)
+        blocker.unblock()
+        self._update_selection_summary()
+
+    def clear_selection(self) -> None:
+        blocker = QtCore.QSignalBlocker(self.table)
+        self.table.clearSelection()
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item:
+                item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+        blocker.unblock()
+        self._update_selection_summary()
+
+    def _on_check_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
+        if item.column() == 0:
+            self.table.clearSelection()
+            self._update_selection_summary()
+
+    def _update_selection_summary(self) -> None:
+        count = len(self.selected_ids())
+        self.selection_summary.setText(f"Đã chọn {count}/{self.table.rowCount()} video")
+        self.remove_button.setEnabled(bool(count) and not self._deleting)
+
     def add_videos(self) -> None:
-        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(self, "Chọn video", self.state.settings.last_project, VIDEO_FILTER)
-        if paths:
-            self.add_paths(paths)
+        if self._video_picker is not None:
+            return
+        dialog = QtWidgets.QFileDialog(self)
+        dialog.setOption(QtWidgets.QFileDialog.Option.DontUseNativeDialog)
+        dialog.setOption(QtWidgets.QFileDialog.Option.DontUseCustomDirectoryIcons)
+        dialog.setWindowTitle("Chọn video")
+        dialog.setFileMode(QtWidgets.QFileDialog.FileMode.ExistingFiles)
+        dialog.setNameFilter(VIDEO_FILTER)
+        if self.state.settings.last_project:
+            dialog.setDirectory(self.state.settings.last_project)
+        self._video_picker = dialog
+        dialog.filesSelected.connect(self.add_paths)
+
+        def finished(_result) -> None:
+            self._video_picker = None
+            dialog.deleteLater()
+
+        dialog.finished.connect(finished)
+        dialog.open()
 
     def add_paths(self, paths: list[str]) -> None:
         project, store = self.state.project, self.state.store
@@ -258,11 +385,15 @@ class VideosTab(QtWidgets.QWidget):
             return infos
 
         def done(infos) -> None:
+            project = self.state.project
+            if self.state.store is not store or project is None:
+                return
+            was_empty = not project.videos
             for path, info in infos:
                 store.add_video(project, path, info)
             self.state.save_project()
             self.window().statusBar().showMessage(f"Đã thêm {len(infos)} video", 4000)
-            if len(project.videos) == len(infos):
+            if was_empty and infos:
                 self.state.openVideoRequested.emit(project.videos[0].id)
 
         run_background(work, done, lambda msg: error(self, msg))
@@ -282,21 +413,90 @@ class VideosTab(QtWidgets.QWidget):
     def remove(self) -> None:
         project, store = self.state.project, self.state.store
         ids = self.selected_ids()
-        if not project or not store or not ids:
+        if not project or not store or not ids or self._deleting:
             return
-        if any(self.state.is_video_locked(v) for v in ids):
+        keys = {(str(store.root), video_id) for video_id in ids}
+        if not keys.isdisjoint(self.state.jobs.locked_videos()):
             error(self, "Có video đang chạy trong hàng đợi.")
             return
         if not confirm(self, "Xoá video", f"Xoá {len(ids)} video khỏi project? (File video gốc không bị xoá, dữ liệu dịch/lồng tiếng sẽ mất.)"):
             return
-        for video_id in ids:
-            store.remove_video(project, video_id)
-        self.state.save_project()
+        # Hộp xác nhận chạy vòng lặp Qt: kiểm tra lại vì hàng đợi có thể vừa nhận việc.
+        if self.state.store is not store or self.state.project is not project:
+            return
+        if not keys.isdisjoint(self.state.jobs.locked_videos()):
+            error(self, "Có video đang chờ, đang chạy hoặc đã dừng trong hàng đợi.")
+            return
+        try:
+            removed = store.remove_videos(project, ids, delete_files=False)
+        except (OSError, ValueError) as exc:
+            error(self, f"Không xoá được video: {exc}")
+            return
+        self.state.videosAboutToBeRemoved.emit(removed)
+        releases = self.state.take_video_releases(store, removed)
+        tasks = self.state.stop_video_tasks(store, removed)
+        self._deleting = True
+        self.delete_status.setText(f"Đang xoá dữ liệu {len(removed)} video…")
+        self.delete_status.show()
+        self._removed_ids = set(removed)
+        self.state.projectChanged.emit()
+
+        def cleanup(progress, _stop):
+            # Chờ tác vụ nghe thử/TTS nhả file ở luồng nền, không chặn giao diện.
+            for task in tasks:
+                task.wait()
+            failures = []
+            for index, video_id in enumerate(removed, start=1):
+                release = releases.get(video_id)
+                if release is not None:
+                    try:
+                        release.result(timeout=5)
+                    except Exception as exc:  # noqa: BLE001 - lỗi player
+                        failures.append(str(exc) or "Trình phát chưa nhả file video.")
+                        continue
+                # mpv xác nhận lệnh stop trước khi Windows nhả mọi handle.
+                deadline = time.monotonic() + (1.0 if release is not None else 0.0)
+                while True:
+                    try:
+                        store.delete_video_files(video_id)
+                        break
+                    except PermissionError as exc:
+                        if time.monotonic() >= deadline:
+                            failures.append(str(exc))
+                            break
+                        time.sleep(0.05)
+                    except (OSError, ValueError) as exc:
+                        failures.append(str(exc))
+                        break
+                progress(index * 100.0 / max(1, len(removed)), f"Đã dọn {index}/{len(removed)} video")
+            return failures
+
+        def done(failures) -> None:
+            self._deleting = False
+            self._update_selection_summary()
+            if failures:
+                self.delete_status.setText(f"Đã bỏ {len(removed)} video; còn {len(failures)} thư mục chưa dọn được.")
+                self.delete_status.setToolTip("\n".join(failures))
+            else:
+                self.delete_status.setText(f"Đã xoá {len(removed)} video. File video gốc được giữ nguyên.")
+
+        def failed(message) -> None:
+            self._deleting = False
+            self._update_selection_summary()
+            self.delete_status.setText(f"Đã bỏ video khỏi project; chưa dọn xong dữ liệu: {message}")
+
+        run_background(cleanup, done, failed, lambda _pct, msg: self.delete_status.setText(msg))
 
     def open_editor(self) -> None:
         ids = self.selected_ids()
         if ids:
             self.state.openVideoRequested.emit(ids[0])
+            self.state.navigateRequested.emit("editor")
+
+    def _open_row(self, index: QtCore.QModelIndex) -> None:
+        item = self.table.item(index.row(), 0)
+        if item:
+            self.state.openVideoRequested.emit(item.data(QtCore.Qt.ItemDataRole.UserRole))
             self.state.navigateRequested.emit("editor")
 
     def recognize_again(self) -> None:
@@ -341,8 +541,50 @@ class VideosTab(QtWidgets.QWidget):
             return
         if self.state.store is not store or self.state.project is not project:
             return
-        self.state.enqueue(ids, steps, only_missing=only_missing)
+        self.state.enqueue(
+            ids, steps, only_missing=only_missing,
+            batch_settings=project.batch_settings if self.batch_enabled.isChecked() else None,
+        )
         self.state.navigateRequested.emit("queue")
+
+    def _refresh_batch_settings(self) -> None:
+        project = self.state.project
+        settings = project.batch_settings if project else None
+        enabled = bool(settings and settings.enabled)
+        self.batch_enabled.blockSignals(True)
+        self.batch_enabled.setChecked(enabled)
+        self.batch_enabled.blockSignals(False)
+        if not enabled:
+            self.batch_summary.setText("Dùng cài đặt riêng của từng video trong Editor.")
+            return
+        audio = "Tắt âm gốc" if settings.original_mode == "mute" else f"Âm gốc {settings.original_volume}%"
+        if settings.original_mode == "duck":
+            audio += " · tự giảm theo TTS"
+        subtitles = (
+            f"Phụ đề {dict(POSITIONS).get(settings.style.position, settings.style.position).lower()}"
+            f" · {settings.style.font_family} {settings.style.font_size:g}px"
+            if settings.subtitles else "Ẩn phụ đề mới đã dịch"
+        )
+        self.batch_summary.setText(f"{audio}  |  {subtitles}")
+
+    def _toggle_batch_settings(self, enabled: bool) -> None:
+        project = self.state.project
+        if not project:
+            return
+        if project.batch_settings is None:
+            project.batch_settings = BatchSettings.from_template(project.template)
+        project.batch_settings.enabled = enabled
+        self.state.save_project()
+
+    def edit_batch_settings(self) -> None:
+        project = self.state.project
+        if not project:
+            return
+        settings = project.batch_settings or BatchSettings.from_template(project.template)
+        dialog = BatchSettingsDialog(settings, self.state.settings.subtitle_presets, self)
+        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            project.batch_settings = dialog.settings()
+            self.state.save_project()
 
     def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:  # noqa: N802
         if event.mimeData().hasUrls():
@@ -577,9 +819,8 @@ class ProjectSettingsTab(QtWidgets.QWidget):
         asr = QtWidgets.QGroupBox("Nhận dạng giọng nói")
         form = form_layout()
         asr.setLayout(form)
-        self.whisper = ComboBox()
-        self.whisper.setEditable(True)
-        form.addRow("Model Whisper", self.whisper)
+        self.asr_engine = ComboBox([("", "Theo cài đặt chung")] + ASR_ENGINES)
+        form.addRow("Bộ nhận dạng", self.asr_engine)
         layout.addWidget(asr)
         layout.addWidget(hint(
             "Thứ tự ưu tiên provider: video (tab Provider trong Editor) > project (ở đây) > mặc định (trang Providers). "
@@ -592,10 +833,9 @@ class ProjectSettingsTab(QtWidgets.QWidget):
         outer.addWidget(scroll_wrap(inner))
 
         self.name.editingFinished.connect(self.commit)
-        for combo in (self.source_lang, self.target_lang, self.context_profile):
+        for combo in (self.source_lang, self.target_lang, self.context_profile, self.asr_engine):
             combo.currentIndexChanged.connect(self.commit)
         self.commit_timer = QtCore.QTimer(self, singleShot=True, interval=600, timeout=self.commit)
-        self.whisper.currentTextChanged.connect(self._commit_later)
         self.auto_context.toggled.connect(self.commit)
         self.output_dir.changed.connect(self.commit)
         self.instructions.textChanged.connect(self._commit_later)
@@ -620,6 +860,7 @@ class ProjectSettingsTab(QtWidgets.QWidget):
         self._loading = True
         self.name.setText(project.name)
         self.source_lang.set_value(project.source_language)
+        self.asr_engine.set_value(project.asr_engine)
         self.target_lang.set_value(project.target_language)
         self.output_dir.set_value(project.output_dir)
         self.context_profile.set_items(
@@ -631,9 +872,6 @@ class ProjectSettingsTab(QtWidgets.QWidget):
         self.auto_context.setChecked(project.context_auto_update)
         if self.instructions.toPlainText() != project.instructions:
             self.instructions.setPlainText(project.instructions)
-        models = sorted(set(downloaded_whisper_models() + KNOWN_WHISPER_MODELS))
-        self.whisper.set_items([(m, m) for m in models], keep=False)
-        self.whisper.setEditText(project.whisper_model)
         self._loading = False
 
     def commit(self, *_args) -> None:
@@ -643,12 +881,12 @@ class ProjectSettingsTab(QtWidgets.QWidget):
         self.commit_timer.stop()
         project.name = self.name.text().strip() or project.name
         project.source_language = self.source_lang.value()
+        project.asr_engine = self.asr_engine.value()
         project.target_language = self.target_lang.value()
         project.output_dir = self.output_dir.value()
         project.context_profile = self.context_profile.value() or ""
         project.context_auto_update = self.auto_context.isChecked()
         project.instructions = self.instructions.toPlainText().strip()
-        project.whisper_model = self.whisper.currentText().strip() or "small"
         self.state.save_project()
 
 class ProjectsPage(QtWidgets.QWidget):

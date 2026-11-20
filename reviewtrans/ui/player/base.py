@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from concurrent.futures import Future
+
 from PyQt6 import QtCore
 
 
@@ -15,7 +17,8 @@ class PlayerBackend(QtCore.QObject):
     def load(self, path: str) -> None:
         raise NotImplementedError
 
-    def unload(self) -> None:
+    def unload(self) -> Future | None:
+        """Đóng nguồn đang phát; trả về tác vụ nếu player phải dừng ở luồng riêng."""
         raise NotImplementedError
 
     def play(self) -> None:

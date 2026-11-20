@@ -150,10 +150,44 @@ class ProjectStore:
         return doc
 
     def remove_video(self, project: Project, video_id: str, delete_files: bool = True) -> None:
-        project.videos = [v for v in project.videos if v.id != video_id]
-        self.save_project(project)
+        self.remove_videos(project, [video_id], delete_files=delete_files)
+
+    def remove_videos(self, project: Project, video_ids: list[str], delete_files: bool = True) -> list[str]:
+        """Bỏ nhiều video bằng một lần ghi project; có thể dọn file ở luồng nền sau."""
+        selected = set(video_ids)
+        removed = [ref.id for ref in project.videos if ref.id in selected]
+        if not removed:
+            return []
+        for video_id in removed:
+            if not video_id or Path(video_id).name != video_id or video_id in (".", ".."):
+                raise ValueError("Đường dẫn dữ liệu video không hợp lệ.")
+            if delete_files:
+                self._video_delete_path(video_id)
+        original = project.videos
+        project.videos = [ref for ref in original if ref.id not in selected]
+        try:
+            self.save_project(project)
+        except OSError:
+            project.videos = original
+            raise
         if delete_files:
-            shutil.rmtree(self.video_dir(video_id), ignore_errors=True)
+            for video_id in removed:
+                self.delete_video_files(video_id)
+        return removed
+
+    def _video_delete_path(self, video_id: str) -> Path:
+        videos = (self.root / "videos").resolve()
+        target = self.video_dir(video_id).resolve()
+        if not video_id or videos != self.root.resolve() / "videos" or target.parent != videos or target != videos / video_id:
+            raise ValueError("Đường dẫn dữ liệu video không hợp lệ.")
+        return target
+
+    def delete_video_files(self, video_id: str) -> None:
+        target = self._video_delete_path(video_id)
+        try:
+            shutil.rmtree(target)
+        except FileNotFoundError:
+            pass
 
     def sync_ref(self, project: Project, doc: VideoDoc) -> None:
         for ref in project.videos:

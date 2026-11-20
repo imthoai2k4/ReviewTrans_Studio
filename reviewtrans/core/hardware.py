@@ -1,4 +1,4 @@
-"""Dò phần cứng tăng tốc: GPU, bộ mã hoá video của ffmpeg, bản whisper.cpp dùng GPU.
+"""Dò phần cứng tăng tốc: GPU và bộ mã hoá video của ffmpeg.
 
 Mọi thứ đều được *chạy thử thật* thay vì đoán theo tên: bản ffmpeg có thể liệt kê h264_nvenc
 nhưng máy không có card NVIDIA, driver cũ có thể thiếu AMF... Kết quả được lưu vào
@@ -7,6 +7,7 @@ nhưng máy không có card NVIDIA, driver cũ có thể thiếu AMF... Kết qu
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -20,7 +21,7 @@ from .paths import IS_WINDOWS, bin_dirs, find_tool, user_data_dir
 from .proc import subprocess_kwargs
 
 LogFn = Callable[[str], None]
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 CACHE_MAX_AGE = 7 * 24 * 3600
 
 VENDORS = {"10de": "nvidia", "1002": "amd", "1022": "amd", "8086": "intel"}
@@ -29,8 +30,8 @@ ENCODER_VENDOR = {"nvenc": "nvidia", "amf": "amd", "qsv": "intel", "mf": "", "":
 
 # codec → (nhãn, họ). "auto" chọn bộ mã hoá GPU tốt nhất của họ đó, không có thì dùng CPU.
 CODECS: list[tuple[str, str]] = [
-    ("auto", "Tự động H.264 (GPU nếu có, không thì CPU)"),
-    ("auto_hevc", "Tự động H.265 (GPU nếu có, không thì CPU)"),
+    ("auto", "Tự động H.264 (ưu tiên GPU rời + CPU)"),
+    ("auto_hevc", "Tự động H.265 (ưu tiên GPU rời + CPU)"),
     ("libx264", "H.264 CPU (x264, tương thích nhất)"),
     ("libx265", "H.265 CPU (x265, nhỏ hơn, chậm)"),
     ("h264_nvenc", "H.264 NVIDIA NVENC"),
@@ -54,12 +55,10 @@ SOFTWARE = {"h264": "libx264", "hevc": "libx265", "av1": "libx264"}
 HW_CODECS = [c for c, _ in CODECS if c not in ("auto", "auto_hevc", "libx264", "libx265")]
 
 ASR_DEVICES = [
-    ("auto", "Tự động (CUDA → Vulkan → CPU)"),
+    ("auto", "Tự động (CUDA → CPU)"),
     ("cuda", "NVIDIA CUDA"),
-    ("vulkan", "Vulkan (AMD / Intel / NVIDIA)"),
     ("cpu", "Chỉ CPU"),
 ]
-WHISPER_VARIANT_DIRS = {"cuda": "whisper-cuda", "vulkan": "whisper-vulkan"}
 VARIANT_NAMES = {"cuda": "CUDA", "vulkan": "Vulkan", "cpu": "CPU"}
 
 
@@ -87,6 +86,8 @@ class EncoderConfig:
     tail: str = "format=yuv420p"  # cuối filter graph
     args: list[str] = field(default_factory=list)  # tham số riêng ngoài chất lượng (vd. -gpu 1)
     device: str = ""  # mô tả thiết bị để hiển thị
+    discrete: bool = False
+    ffmpeg: str = ""  # FFmpeg thay thế đã chạy thử với bộ mã hoá này
 
     @property
     def hardware(self) -> bool:
@@ -104,6 +105,7 @@ class HardwareInfo:
     compute_cap: str = ""
     encoders: dict[str, EncoderConfig] = field(default_factory=dict)
     failed: dict[str, str] = field(default_factory=dict)  # codec → lỗi
+    alternate_ffmpeg: str = ""  # chữ ký FFmpeg thay thế đã dò
 
     def vendors(self) -> set[str]:
         return {g.vendor for g in self.gpus}
@@ -116,7 +118,9 @@ class HardwareInfo:
 
     @classmethod
     def from_dict(cls, data: dict) -> "HardwareInfo":
-        info = cls(**{k: v for k, v in data.items() if k in ("version", "detected_at", "ffmpeg", "cuda_version", "nvidia_driver", "compute_cap", "failed")})
+        info = cls(**{k: v for k, v in data.items() if k in (
+            "version", "detected_at", "ffmpeg", "cuda_version", "nvidia_driver", "compute_cap", "failed", "alternate_ffmpeg",
+        )})
         info.gpus = [Gpu(**g) for g in data.get("gpus", [])]
         info.encoders = {k: EncoderConfig(**v) for k, v in data.get("encoders", {}).items()}
         return info
@@ -151,6 +155,17 @@ def _ffmpeg_signature(ffmpeg: Path | None) -> str:
     except OSError:
         return ""
     return f"{ffmpeg}|{stat.st_size}|{int(stat.st_mtime)}"
+
+
+def _system_ffmpeg(primary: Path) -> Path | None:
+    """Find an installed Windows FFmpeg other than the one supplied by the app."""
+    primary = primary.resolve()
+    for directory in map(Path, os.get_exec_path()):
+        if directory.is_absolute():
+            candidate = directory / "ffmpeg.exe"
+            if candidate.is_file() and candidate.resolve() != primary:
+                return candidate.resolve()
+    return None
 
 
 # ------------------------------------------------------------------ GPU
@@ -259,7 +274,10 @@ def _candidates(codec: str, gpus: list[Gpu]) -> list[EncoderConfig]:
     if kind == "nvenc":
         if IS_WINDOWS and gpus and "nvidia" not in vendors:
             return []
-        return [EncoderConfig(codec, device="NVIDIA")]
+        nvidia = [g for g in ordered if g.vendor == "nvidia"]
+        return [EncoderConfig(
+            codec, device=nvidia[0].name if len(nvidia) == 1 else "NVIDIA", discrete=True,
+        )]
     if kind == "amf":
         if not IS_WINDOWS:
             return []
@@ -270,13 +288,15 @@ def _candidates(codec: str, gpus: list[Gpu]) -> list[EncoderConfig]:
                 pre_args=["-init_hw_device", f"d3d11va=rtdx:{g.adapter}", "-filter_hw_device", "rtdx"],
                 tail="format=nv12,hwupload",
                 device=g.name,
+                discrete=not g.integrated,
             )
             for g in ordered if g.vendor == "amd"
         ]
     if kind == "qsv":
         if IS_WINDOWS and gpus and "intel" not in vendors:
             return []
-        configs = [EncoderConfig(codec, tail="format=nv12", device="Intel")]
+        default = EncoderConfig(codec, tail="format=nv12", device="Intel")
+        configs = [default]
         for g in ordered:
             if g.vendor == "intel":
                 configs.append(EncoderConfig(
@@ -285,8 +305,9 @@ def _candidates(codec: str, gpus: list[Gpu]) -> list[EncoderConfig]:
                               "-filter_hw_device", "rtqs"],
                     tail="format=nv12,hwupload=extra_hw_frames=64",
                     device=g.name,
+                    discrete=not g.integrated,
                 ))
-        return configs
+        return sorted(configs, key=lambda config: not config.discrete)
     if kind == "mf":
         return [EncoderConfig(codec, tail="format=nv12", device="Media Foundation")] if IS_WINDOWS and gpus else []
     return []
@@ -301,6 +322,9 @@ def probe_command(ffmpeg: Path, config: EncoderConfig, crf: int = 23) -> list[st
     ]
 
 
+NVENC_API_MISMATCH = "does not support the required nvenc API version"
+
+
 def probe_encoder(ffmpeg: Path, config: EncoderConfig, attempts: int = 4) -> tuple[bool, str]:
     """Mã hoá thử vài khung hình, thử lại ngay nếu lỗi: GPU rời trên laptop tự tắt sau ~1 giây rảnh và lần gọi
     đầu tiên khi nó vừa thức dậy thường lỗi (AMF báo lỗi 30). Chờ lâu giữa các lần thử chỉ làm GPU ngủ lại."""
@@ -310,7 +334,7 @@ def probe_encoder(ffmpeg: Path, config: EncoderConfig, attempts: int = 4) -> tup
         if code == 0:
             return True, ""
         message = next((line.strip() for line in output.splitlines() if line.strip()), f"mã lỗi {code}")
-        if "Cannot load" in output:
+        if "Cannot load" in output or NVENC_API_MISMATCH in output:
             break  # thiếu driver/DLL (vd. nvcuda.dll), thử lại vô ích
         if attempt + 1 < attempts:
             time.sleep(0.2)
@@ -328,7 +352,6 @@ def _encoder_list(ffmpeg: Path) -> set[str]:
 
 _lock = threading.Lock()
 _cached: HardwareInfo | None = None
-_session_failed: set[str] = set()
 
 
 def cache_path() -> Path:
@@ -346,6 +369,9 @@ def load_cached() -> HardwareInfo | None:
         return None
     if info.version != CACHE_VERSION or info.ffmpeg != _ffmpeg_signature(find_tool("ffmpeg")):
         return None
+    if info.alternate_ffmpeg:
+        if info.alternate_ffmpeg != _ffmpeg_signature(Path(info.alternate_ffmpeg.split("|", 1)[0])):
+            return None
     if time.time() - info.detected_at > CACHE_MAX_AGE:
         return None
     _cached = info
@@ -370,6 +396,7 @@ def detect(force: bool = False, log: LogFn | None = None) -> HardwareInfo:
         say("GPU: " + (", ".join(g.label for g in info.gpus) or "không thấy"))
         if ffmpeg is not None:
             available = _encoder_list(ffmpeg)
+            alternate = _system_ffmpeg(ffmpeg) if IS_WINDOWS else None
             for codec in HW_CODECS:
                 if codec not in available:
                     continue
@@ -379,6 +406,14 @@ def detect(force: bool = False, log: LogFn | None = None) -> HardwareInfo:
                 error = ""
                 for config in configs:
                     ok, error = probe_encoder(ffmpeg, config)
+                    if not ok and alternate and encoder_vendor(codec) == "nvenc" and NVENC_API_MISMATCH in error:
+                        ok, alt_error = probe_encoder(alternate, config)
+                        if ok:
+                            config.ffmpeg = str(alternate)
+                            info.alternate_ffmpeg = _ffmpeg_signature(alternate)
+                            say(f"  {codec}: dùng FFmpeg tương thích tại {alternate}")
+                        else:
+                            say(f"  FFmpeg tại {alternate}, {codec}: {alt_error}")
                     if ok:
                         info.encoders[codec] = config
                         say(f"  ✓ {codec} ({config.device})")
@@ -386,7 +421,6 @@ def detect(force: bool = False, log: LogFn | None = None) -> HardwareInfo:
                 else:
                     info.failed[codec] = error
                     say(f"  ✕ {codec}: {error}")
-        _session_failed.clear()
         _cached = info
         try:
             cache_path().write_text(json.dumps(info.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
@@ -399,12 +433,6 @@ def forget() -> None:
     """Xoá kết quả dò (dùng trong test / khi đổi ffmpeg)."""
     global _cached
     _cached = None
-    _session_failed.clear()
-
-
-def mark_failed(codec: str) -> None:
-    """Bộ mã hoá lỗi khi xuất thật → bỏ qua nó trong phiên làm việc này."""
-    _session_failed.add(codec)
 
 
 def resolve_encoder(requested: str, info: HardwareInfo | None, exclude=()) -> tuple[EncoderConfig, str]:
@@ -414,81 +442,17 @@ def resolve_encoder(requested: str, info: HardwareInfo | None, exclude=()) -> tu
     software = EncoderConfig(SOFTWARE[family(requested)])
     if requested in ("libx264", "libx265"):
         return EncoderConfig(requested), ""
-    skip = _session_failed | set(exclude)
+    skip = set(exclude)
     encoders = {k: v for k, v in (info.encoders if info else {}).items() if k not in skip}
     if requested in AUTO_ORDER:
-        for codec in AUTO_ORDER[requested]:
-            if codec in encoders:
-                return encoders[codec], f"Tự động chọn {codec} ({encoders[codec].device})"
-        return software, "Không có bộ mã hoá GPU dùng được → dùng CPU"
+        available = [encoders[codec] for codec in AUTO_ORDER[requested] if codec in encoders]
+        if not available:
+            return software, "Không có bộ mã hoá GPU dùng được → dùng CPU"
+        chosen = next((config for config in available if config.discrete), available[0])
+        return chosen, f"Tự động chọn {chosen.codec} ({chosen.device})"
     if requested in encoders:
         return encoders[requested], ""
     if info is None and requested not in skip:  # chưa dò: cứ thử, lỗi sẽ chuyển sang CPU
         return EncoderConfig(requested, tail="format=nv12" if encoder_vendor(requested) in ("qsv", "mf") else "format=yuv420p"), ""
     reason = (info.failed.get(requested) if info else "") or ("vừa lỗi" if requested in skip else "không có trên máy này")
     return software, f"{requested} không dùng được ({reason}) → dùng {software.codec}"
-
-
-# ------------------------------------------------------------------ whisper.cpp
-
-
-def _whisper_exe(directory: Path) -> Path | None:
-    for name in ("whisper-cli", "whisper", "main"):
-        for candidate in (directory / f"{name}.exe", directory / name):
-            if candidate.is_file():
-                return candidate
-    return None
-
-
-def whisper_variants() -> dict[str, Path]:
-    """Các bản whisper.cpp đang có: cpu (thư mục bin), cuda/vulkan (thư mục con riêng vì DLL ggml khác nhau)."""
-    found: dict[str, Path] = {}
-    for variant, folder in WHISPER_VARIANT_DIRS.items():
-        for directory in bin_dirs():
-            exe = _whisper_exe(directory / folder)
-            if exe:
-                found[variant] = exe
-                break
-    cpu = find_tool("whisper")
-    if cpu:
-        found["cpu"] = cpu
-    return found
-
-
-def whisper_plan(device: str, info: HardwareInfo | None = None) -> list[tuple[str, Path, list[str]]]:
-    """Thứ tự các bản whisper sẽ thử: [(tên, exe, tham số thêm)]. Bản sau là dự phòng khi bản trước lỗi."""
-    variants = whisper_variants()
-    has_gpu = bool(info.gpus) if info else True
-    order: list[str]
-    if device == "cpu":
-        order = []
-    elif device in ("cuda", "vulkan"):
-        order = [device]
-    else:
-        order = []
-        if "cuda" in variants and (info is None or info.has_nvidia()):
-            order.append("cuda")
-        if "vulkan" in variants and has_gpu:
-            order.append("vulkan")
-    plan = [(name, variants[name], []) for name in order if name in variants]
-    if "cpu" in variants:
-        plan.append(("cpu", variants["cpu"], []))
-    elif plan:
-        name, exe, _ = plan[-1]
-        plan.append(("cpu", exe, ["-ng"]))  # chỉ có bản GPU: tắt GPU khi chạy dự phòng
-    return plan
-
-
-def cuda_package(info: HardwareInfo | None) -> str:
-    """Chọn gói cuBLAS phù hợp: 12.4 cho GPU mới (compute ≥ 8.9, RTX 40/50), còn lại 11.8 (nhẹ hơn nhiều)."""
-    try:
-        cap = float(info.compute_cap) if info and info.compute_cap else 0.0
-    except ValueError:
-        cap = 0.0
-    try:
-        cuda = float(".".join((info.cuda_version if info else "").split(".")[:2]) or 0)
-    except ValueError:
-        cuda = 0.0
-    if cap >= 8.9 and (cuda == 0.0 or cuda >= 12.4):
-        return "12.4.0"
-    return "11.8.0"

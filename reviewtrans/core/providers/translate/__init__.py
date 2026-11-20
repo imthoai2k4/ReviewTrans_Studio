@@ -4,11 +4,8 @@ from ...config import ProviderProfile
 from .. import ProviderError
 from .base import LLMTranslator, TranslateJob, Translator
 from .llm import AnthropicTranslator, GeminiCompatTranslator, OpenAICompatTranslator
-from .machine import GoogleTranslator, MicrosoftTranslator
 
 _KINDS: dict[str, type[Translator]] = {
-    "google": GoogleTranslator,
-    "microsoft": MicrosoftTranslator,
     "openai": OpenAICompatTranslator,
     "gemini": GeminiCompatTranslator,
     "anthropic": AnthropicTranslator,

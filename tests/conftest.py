@@ -23,7 +23,8 @@ def qapp():
 
 @pytest.fixture()
 def home(tmp_path, monkeypatch):
-    """Cô lập ~/.video_translation_studio trong thư mục tạm."""
+    """Cô lập dữ liệu ứng dụng và cấu hình cũ trong thư mục tạm."""
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    monkeypatch.setenv("REVIEWTRANS_DATA_DIR", str(tmp_path / "home" / ".video_translation_studio"))
     (tmp_path / "home").mkdir()
     return tmp_path / "home"

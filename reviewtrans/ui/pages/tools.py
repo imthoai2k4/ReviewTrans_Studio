@@ -6,6 +6,7 @@ from pathlib import Path
 
 from PyQt6 import QtCore, QtWidgets
 
+from ...core.paths import temp_dir
 from ...core.proc import parse_progress_time, probe, require_tool, run
 from ..jobs import FunctionThread, run_background
 from ..state import AppState
@@ -20,7 +21,7 @@ def _concat_line(path: Path) -> str:
 def merge_videos(paths: list[str], output: str, reencode: bool, log, progress, stop) -> str:
     ffmpeg = require_tool("ffmpeg")
     total = sum(probe(p).duration for p in paths)
-    work = Path(tempfile.mkdtemp(prefix="merge_"))
+    work = Path(tempfile.mkdtemp(prefix="merge_", dir=temp_dir()))
     concat = work / "list.txt"
     concat.write_text("\n".join(_concat_line(Path(p)) for p in paths) + "\n", encoding="utf-8")
     command = [str(ffmpeg), "-y", "-hide_banner", "-nostats", "-progress", "pipe:1", "-f", "concat", "-safe", "0", "-i", str(concat)]

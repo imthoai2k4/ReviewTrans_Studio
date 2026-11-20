@@ -9,10 +9,6 @@ USER_DIR_NAME = ".video_translation_studio"
 
 IS_WINDOWS = platform.system().lower().startswith("win")
 
-# Tên thay thế cho từng công cụ (whisper.cpp đổi tên main.exe -> whisper-cli.exe).
-TOOL_ALIASES = {
-    "whisper": ["whisper-cli", "whisper", "main"],
-}
 
 
 def app_root() -> Path:
@@ -41,13 +37,20 @@ def is_portable() -> bool:
 
 
 def user_data_dir() -> Path:
-    path = exe_dir() / "data" if is_portable() else Path.home() / USER_DIR_NAME
+    """Bản chạy mã nguồn và portable lưu dữ liệu cạnh app, độc lập thư mục terminal."""
+    override = os.environ.get("REVIEWTRANS_DATA_DIR")
+    if override:
+        path = Path(override).expanduser().resolve()
+    elif not getattr(sys, "frozen", False) or is_portable():
+        path = exe_dir() / "data"
+    else:
+        path = Path.home() / USER_DIR_NAME
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def user_bin_dir() -> Path:
-    """Nơi lưu các công cụ tải về (ffmpeg, whisper, libmpv)."""
+    """Nơi lưu các công cụ tải về (ffmpeg, libmpv)."""
     path = user_data_dir() / "bin"
     path.mkdir(parents=True, exist_ok=True)
     return path
@@ -65,8 +68,15 @@ def fonts_dir() -> Path:
     return path
 
 
+def temp_dir() -> Path:
+    """File tải, giải nén và âm thanh thử nằm cùng ổ với dữ liệu ứng dụng."""
+    path = user_data_dir() / "tmp"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def default_projects_root() -> Path:
-    if is_portable():
+    if os.environ.get("REVIEWTRANS_DATA_DIR") or not getattr(sys, "frozen", False) or is_portable():
         return user_data_dir() / "projects"
     return Path.home() / "ReviewTrans Projects"
 
@@ -82,7 +92,7 @@ def bin_dirs() -> list[Path]:
 
 def _executable_names(name: str) -> list[str]:
     names = []
-    for alias in TOOL_ALIASES.get(name, [name]):
+    for alias in [name]:
         if IS_WINDOWS:
             names.append(f"{alias}.exe")
         names.append(alias)

@@ -11,20 +11,25 @@ from .paths import default_projects_root, user_data_dir
 
 # kind -> nhãn hiển thị
 TRANSLATE_KINDS = {
-    "google": "Google Translate",
-    "microsoft": "Microsoft Translator",
     "openai": "API kiểu OpenAI",
     "gemini": "API kiểu Gemini",
     "anthropic": "Anthropic (Claude)",
 }
 LLM_KINDS = {"openai", "gemini", "anthropic"}
+THINKING_OPTIONS = [
+    ("", "Theo mặc định API"), ("disabled", "Tắt"), ("enabled", "Bật tự động"),
+    ("low", "Thấp (Low)"), ("medium", "Vừa (Medium)"), ("high", "Cao (High)"),
+]
+DEFAULT_TRANSLATE_BATCH_SIZE = 200
+MAX_TRANSLATE_BATCH_SIZE = 200
 
 TTS_KINDS = {
-    "edge": "Edge TTS (miễn phí)",
     "vbee": "vBee",
     "openai_speech": "API kiểu OpenAI (/v1/audio/speech)",
     "legacy_custom": "Custom API (bản cũ)",
 }
+
+ASR_ENGINES = [("paraformer", "Paraformer-zh + FSMN-VAD + CT-Punc")]
 
 
 @dataclass
@@ -47,7 +52,7 @@ class ProviderProfile:
         return self.kind in LLM_KINDS
 
 
-SETTINGS_VERSION = 2
+SETTINGS_VERSION = 5
 
 
 @dataclass
@@ -68,11 +73,11 @@ class AppSettings:
     default_target_language: str = "vi"
     default_translate_profile: str = ""
     default_tts_profile: str = ""
-    default_whisper_model: str = "small"
-    whisper_threads: int = 0  # 0 = tự động theo số nhân CPU
-    asr_device: str = "auto"  # auto | cuda | vulkan | cpu
-    translate_batch_size: int = 60
-    tts_concurrency: int = 3
+    default_asr_engine: str = "paraformer"
+    asr_threads: int = 0  # 0 = tự động theo số nhân CPU
+    asr_device: str = "auto"  # auto | cuda | cpu
+    translate_batch_size: int = DEFAULT_TRANSLATE_BATCH_SIZE
+    tts_concurrency: int = 0  # 0 = gửi tuần tự, không bật nhiều luồng TTS
     player_backend: str = "auto"  # auto | mpv | qt
     render: RenderSettings = field(default_factory=RenderSettings)
     translate_profiles: list[ProviderProfile] = field(default_factory=list)
@@ -120,13 +125,12 @@ def builtin_presets() -> list[SubtitleStyle]:
 
 def default_settings() -> AppSettings:
     settings = AppSettings()
-    google = ProviderProfile(name="Google Translate", kind="google")
-    microsoft = ProviderProfile(name="Microsoft Translator", kind="microsoft")
-    edge = ProviderProfile(name="Edge TTS", kind="edge", options={"voice": "vi-VN-HoaiMyNeural"})
-    settings.translate_profiles = [google, microsoft]
-    settings.tts_profiles = [edge]
-    settings.default_translate_profile = google.id
-    settings.default_tts_profile = edge.id
+    translate = ProviderProfile(name="API dịch", kind="openai")
+    speech = ProviderProfile(name="API TTS", kind="openai_speech")
+    settings.translate_profiles = [translate]
+    settings.tts_profiles = [speech]
+    settings.default_translate_profile = translate.id
+    settings.default_tts_profile = speech.id
     settings.subtitle_presets = builtin_presets()
     return settings
 
@@ -137,12 +141,32 @@ def upgrade_settings(settings: AppSettings, version: int) -> None:
         # 2.1: tăng tốc phần cứng — giá trị mặc định cũ chuyển sang tự động
         if settings.render.video_codec == "libx264":
             settings.render.video_codec = "auto"
-        if settings.whisper_threads == 4:
-            settings.whisper_threads = 0
+        if settings.asr_threads == 4:
+            settings.asr_threads = 0
+    if version < 3:
+        defaults = default_settings()
+        settings.translate_profiles = [p for p in settings.translate_profiles if p.kind in TRANSLATE_KINDS]
+        settings.tts_profiles = [p for p in settings.tts_profiles if p.kind in TTS_KINDS]
+        settings.translate_profiles = settings.translate_profiles or defaults.translate_profiles
+        settings.tts_profiles = settings.tts_profiles or defaults.tts_profiles
+        for kind in ("translate", "tts"):
+            profiles = getattr(settings, f"{kind}_profiles")
+            field_name = f"default_{kind}_profile"
+            if getattr(settings, field_name) not in {p.id for p in profiles}:
+                setattr(settings, field_name, profiles[0].id)
+        if settings.tts_concurrency == 3:
+            settings.tts_concurrency = 0
+    if version < 4:
+        if settings.translate_batch_size == 60:
+            settings.translate_batch_size = DEFAULT_TRANSLATE_BATCH_SIZE
+        settings.translate_batch_size = min(settings.translate_batch_size, MAX_TRANSLATE_BATCH_SIZE)
+    settings.default_asr_engine = "paraformer"
+    if settings.asr_device == "vulkan":
+        settings.asr_device = "auto"
     settings.settings_version = SETTINGS_VERSION
 
 
-def whisper_thread_count(value: int) -> int:
+def asr_thread_count(value: int) -> int:
     if value > 0:
         return value
     return max(1, min(8, (os.cpu_count() or 4) - 1))
@@ -195,10 +219,15 @@ class SettingsStore:
         if self.path.exists():
             try:
                 data = json.loads(self.path.read_text(encoding="utf-8"))
+                if "asr_threads" not in data and "whisper_threads" in data:
+                    data["asr_threads"] = data["whisper_threads"]
                 settings = from_dict(AppSettings, data)
                 upgrade_settings(settings, int(data.get("settings_version", 1)))
                 if not settings.subtitle_presets:
                     settings.subtitle_presets = builtin_presets()
+                if int(data.get("settings_version", 1)) < SETTINGS_VERSION:
+                    self.settings = settings
+                    self.save()
                 return settings
             except (OSError, json.JSONDecodeError):
                 backup = self.path.with_suffix(".broken.json")

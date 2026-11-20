@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from .. import ProviderError
 from .base import LLMTranslator
+from .thinking import protocol, request_options
 
 
 def _temperature(profile) -> float:
@@ -21,14 +22,19 @@ class OpenAICompatTranslator(LLMTranslator):
         client = openai.OpenAI(
             api_key=key or "sk-no-key",
             base_url=self.profile.base_url or None,
-            timeout=300,
+            timeout=self.request_timeout,
             max_retries=0,
         )
-        response = client.chat.completions.create(
+        request = dict(
             model=self.model,
             messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}],
             temperature=_temperature(self.profile),
         )
+        thinking = self.thinking_mode()
+        request.update(request_options(self.profile, self.model, thinking))
+        if thinking and thinking != "disabled" and protocol(self.profile) in ("openai", "deepseek"):
+            request.pop("temperature", None)
+        response = client.chat.completions.create(**request)
         content = response.choices[0].message.content if response.choices else None
         if not content:
             raise ProviderError("API trả về nội dung rỗng")
@@ -38,7 +44,24 @@ class OpenAICompatTranslator(LLMTranslator):
         import openai
 
         client = openai.OpenAI(api_key=self.keys.current() or "sk-no-key", base_url=self.profile.base_url or None, timeout=30)
-        return sorted(model.id for model in client.models.list())
+        models = list(client.models.list())
+        if protocol(self.profile) == "openrouter":
+            catalog = {}
+            for model in models:
+                data = model.model_dump()
+                reasoning = data.get("reasoning") or {}
+                parameters = data.get("supported_parameters") or []
+                catalog[model.id] = {
+                    "supported": bool(reasoning) or "reasoning" in parameters or "reasoning_effort" in parameters,
+                    "required": reasoning.get("mandatory", False),
+                    "efforts": (
+                        ["low", "medium", "high"] if "supported_efforts" in reasoning
+                        and reasoning["supported_efforts"] is None else reasoning.get("supported_efforts", [])
+                    ),
+                }
+            self.profile.options["reasoning_catalog"] = catalog
+            self.profile.options["reasoning_catalog_url"] = self.profile.base_url
+        return sorted(model.id for model in models)
 
 
 class GeminiCompatTranslator(LLMTranslator):
@@ -50,7 +73,11 @@ class GeminiCompatTranslator(LLMTranslator):
 
         if not key:
             raise ProviderError("Thiếu API key Gemini")
-        http_options = types.HttpOptions(base_url=self.profile.base_url) if self.profile.base_url else None
+        # google-genai 3.x mặc định dùng v1, chưa hỗ trợ system_instruction.
+        http_options = types.HttpOptions(
+            api_version="v1beta", base_url=self.profile.base_url or None,
+            timeout=int(self.request_timeout * 1000),
+        )
         client = genai.Client(api_key=key, http_options=http_options)
         response = client.models.generate_content(
             model=self.model,
@@ -69,7 +96,7 @@ class GeminiCompatTranslator(LLMTranslator):
         from google import genai
         from google.genai import types
 
-        http_options = types.HttpOptions(base_url=self.profile.base_url) if self.profile.base_url else None
+        http_options = types.HttpOptions(api_version="v1beta", base_url=self.profile.base_url or None)
         client = genai.Client(api_key=self.keys.current(), http_options=http_options)
         names = []
         for model in client.models.list():
@@ -89,7 +116,9 @@ class AnthropicTranslator(LLMTranslator):
 
         if not key:
             raise ProviderError("Thiếu API key Anthropic")
-        client = anthropic.Anthropic(api_key=key, base_url=self.profile.base_url or None, max_retries=2)
+        client = anthropic.Anthropic(
+            api_key=key, base_url=self.profile.base_url or None, timeout=self.request_timeout, max_retries=0,
+        )
         request = dict(
             model=self.model,
             max_tokens=16000,

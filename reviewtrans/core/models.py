@@ -22,6 +22,9 @@ def from_dict(cls: type[T], data: Any) -> T:
     """Dựng dataclass từ dict, bỏ qua khoá lạ và giữ mặc định cho khoá thiếu."""
     if not isinstance(data, dict):
         return cls()
+    data = dict(data)
+    if cls.__name__ in ("Project", "VideoDoc") and data.get("asr_engine") in ("whisper", "auto"):
+        data["asr_engine"] = "paraformer"
     hints = get_type_hints(cls)
     kwargs = {}
     for f in dataclasses.fields(cls):
@@ -152,9 +155,11 @@ class Layer:
 
 @dataclass
 class AudioSettings:
-    original_mode: str = "duck"  # keep | duck | mute
-    original_volume: int = 100  # %
-    duck_volume: int = 20  # % âm gốc trong lúc có lồng tiếng
+    original_mode: str = "keep"  # keep: âm lượng cố định | duck: giảm theo TTS | mute
+    original_volume: int = 20  # % âm lượng video gốc, dùng suốt video ở chế độ keep
+    duck_volume: int = 20  # % của original_volume trong lúc có lồng tiếng
+    duck_attack: float = 0.15  # giây giảm dần trước khi câu TTS bắt đầu
+    duck_release: float = 0.6  # giây tăng dần sau khi câu TTS kết thúc
     dub_volume: int = 100
     bgm_path: str = ""
     bgm_volume: int = 25
@@ -187,6 +192,7 @@ class Segment:
     tts_key: str = ""
     tts_duration: float = 0.0
     locked: bool = False  # không bị dịch đè khi chạy lại
+    tts_error: str = ""
 
     @property
     def duration(self) -> float:
@@ -225,6 +231,26 @@ class VideoTemplate:
 
 
 @dataclass
+class BatchSettings:
+    """Cài đặt âm gốc và phụ đề dùng khi chạy hàng loạt."""
+
+    enabled: bool = True
+    original_mode: str = "keep"
+    original_volume: int = 20
+    subtitles: bool = True
+    style: SubtitleStyle = field(default_factory=SubtitleStyle)
+
+    @classmethod
+    def from_template(cls, template: VideoTemplate) -> BatchSettings:
+        return cls(
+            original_mode=template.audio.original_mode,
+            original_volume=template.audio.original_volume,
+            subtitles=template.tracks.subtitles,
+            style=clone(template.style),
+        )
+
+
+@dataclass
 class VideoDoc:
     id: str = field(default_factory=new_id)
     name: str = ""
@@ -236,7 +262,7 @@ class VideoDoc:
     has_audio: bool = True
     source_mode: str = "asr"  # asr | srt
     srt_path: str = ""
-    whisper_model: str = ""  # trống = theo project
+    asr_engine: str = ""  # trống = theo project → cài đặt chung
     source_language: str = ""  # trống = theo project
     # provider riêng cho video (trống = kế thừa project → mặc định)
     translate_profile: str = ""
@@ -280,6 +306,26 @@ class VideoDoc:
         self.tracks = clone(template.tracks)
         self.flip_horizontal = template.flip_horizontal
 
+    def apply_batch_settings(self, settings: BatchSettings) -> None:
+        if not settings.enabled:
+            return
+        original_audio = settings.original_mode != "mute"
+        audio_changed = (
+            self.audio.original_mode != settings.original_mode
+            or self.audio.original_volume != settings.original_volume
+            or self.tracks.original_audio != original_audio
+        )
+        subtitles_changed = self.style != settings.style or self.tracks.subtitles != settings.subtitles
+        self.audio.original_mode = settings.original_mode
+        self.audio.original_volume = settings.original_volume
+        self.tracks.original_audio = original_audio
+        self.style = clone(settings.style)
+        self.tracks.subtitles = settings.subtitles
+        if audio_changed:
+            self.mark_stale_from("mix")
+        elif subtitles_changed:
+            self.mark_stale_from("render")
+
 
 @dataclass
 class VideoRef:
@@ -302,11 +348,12 @@ class Project:
     context_auto_update: bool = True
     tts_profile: str = ""
     tts_voice: str = ""
-    whisper_model: str = "small"
+    asr_engine: str = ""  # trống = theo cài đặt chung
     instructions: str = ""
     output_dir: str = ""
     template: VideoTemplate = field(default_factory=VideoTemplate)
     videos: list[VideoRef] = field(default_factory=list)
+    batch_settings: BatchSettings | None = None
 
 
 # ---------------------------------------------------------------- context

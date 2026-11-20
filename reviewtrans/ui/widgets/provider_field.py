@@ -179,9 +179,9 @@ class ProviderField(QtWidgets.QWidget):
             self.value.set_items(items, keep=False)
             self.value.set_value(own_value)
             self.value.blockSignals(False)
-            self.fetch.setEnabled(profile is not None and profile.kind in ("edge", "openai_speech"))
+            self.fetch.setEnabled(profile is not None and profile.kind == "openai_speech")
             # tự tải danh sách giọng một lần cho mỗi provider (lỗi cũng ghi nhận để không lặp lại)
-            if profile is not None and ("tts", profile.id) not in _remote and profile.kind in ("edge", "openai_speech"):
+            if profile is not None and ("tts", profile.id) not in _remote and profile.kind == "openai_speech":
                 _remote[("tts", profile.id)] = []
                 QtCore.QTimer.singleShot(0, lambda: self.fetch_remote(silent=True))
 

@@ -11,7 +11,6 @@ from ..core.store import ProjectStore
 from .icons import icon
 from .jobs import RUNNING, run_background
 from .pages.editor import EditorPage
-from .pages.presets import PresetsPage
 from .pages.projects import ProjectsPage
 from .pages.providers import ProvidersPage
 from .pages.queue import QueuePage
@@ -27,8 +26,7 @@ NAV = [
     ("projects", "Project", "projects"),
     ("editor", "Editor", "editor"),
     ("queue", "Hàng đợi", "queue"),
-    ("providers", "Providers", "providers"),
-    ("presets", "Preset", "presets"),
+    ("providers", "API", "providers"),
     ("resources", "Tài nguyên", "resources"),
     ("tools", "Công cụ", "tools"),
     ("video_downloads", "Tải video", "download"),
@@ -63,7 +61,6 @@ class MainWindow(QtWidgets.QMainWindow):
             "editor": EditorPage(state),
             "queue": QueuePage(state),
             "providers": ProvidersPage(state),
-            "presets": PresetsPage(state),
             "resources": ResourcesPage(state),
             "tools": ToolsPage(state),
             "video_downloads": self.video_downloads,
@@ -138,7 +135,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.job_bar.setVisible(busy)
         pending = sum(1 for j in self.state.jobs.jobs if j.state == "pending")
         if not busy:
-            self.job_label.setText("Hàng đợi trống")
+            self.job_label.setText("Hàng đợi đã dừng" if self.state.jobs.is_paused() else "Hàng đợi trống")
         elif pending:
             self.job_label.setToolTip(f"Còn {pending} việc chờ")
 

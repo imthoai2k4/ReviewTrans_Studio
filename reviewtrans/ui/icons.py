@@ -12,7 +12,6 @@ GLYPHS = {
     "editor": "",
     "queue": "",
     "providers": "",
-    "presets": "",
     "resources": "",
     "tools": "",
     "settings": "",

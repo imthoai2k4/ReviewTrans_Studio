@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from concurrent.futures import Future
 from pathlib import Path
 
 from PyQt6 import QtCore, QtGui, QtMultimedia, QtWidgets
 
+from ...core.config import ASR_ENGINES
 from ...core.langs import SOURCE_LANGUAGES, display_name
 from ...core.models import (
     STAGE_LABELS,
@@ -17,7 +19,6 @@ from ...core.models import (
 from ...core.pipeline import RunContext
 from ...core.pipeline.mix import plan_clips, run_mix
 from ...core.pipeline.render import run_render
-from ...core.pipeline.resources import KNOWN_WHISPER_MODELS, downloaded_whisper_models
 from ...core.pipeline.translate import translate_segments
 from ...core.pipeline.tts import resolve_voice, run_tts, segment_key, tts_path, tts_resolved
 from ...core.resolve import resolve
@@ -206,11 +207,10 @@ class VideoSettingsPanel(QtWidgets.QWidget):
         self.source = PathEdit("file", "Video (*.*)")
         self.info = QtWidgets.QLabel()
         self.info.setStyleSheet(f"color: {TEXT_DIM};")
-        self.mode = ComboBox([("asr", "Nhận dạng giọng nói (Whisper)"), ("srt", "Dùng file SRT có sẵn")])
+        self.mode = ComboBox([("asr", "Nhận dạng giọng nói"), ("srt", "Dùng file SRT có sẵn")])
+        self.asr_engine = ComboBox([("", "Theo project / cài đặt chung")] + ASR_ENGINES)
         self.srt = PathEdit("file", "Phụ đề (*.srt);;Tất cả (*.*)")
         self.language = ComboBox([("", "Theo project")] + [(c, display_name(c)) for c in SOURCE_LANGUAGES])
-        self.whisper = ComboBox()
-        self.whisper.setEditable(True)
         self.flip = QtWidgets.QCheckBox("Lật ngang video (tránh bản quyền)")
         form.addRow("Tên", self.name)
         form.addRow("File video", self.source)
@@ -218,7 +218,7 @@ class VideoSettingsPanel(QtWidgets.QWidget):
         form.addRow("Lấy câu thoại", self.mode)
         form.addRow("File SRT", self.srt)
         form.addRow("Ngôn ngữ gốc", self.language)
-        form.addRow("Model Whisper", self.whisper)
+        form.addRow("Bộ nhận dạng", self.asr_engine)
         form.addRow("", self.flip)
         layout.addWidget(box)
         out = QtWidgets.QGroupBox("Xuất")
@@ -241,10 +241,10 @@ class VideoSettingsPanel(QtWidgets.QWidget):
         self.mode.currentIndexChanged.connect(lambda _i: self._commit("mode"))
         self.srt.changed.connect(lambda _p: self._commit("srt"))
         self.language.currentIndexChanged.connect(lambda _i: self._commit("language"))
-        self.whisper.currentTextChanged.connect(lambda _t: self._commit("whisper"))
+        self.asr_engine.currentIndexChanged.connect(lambda _i: self._commit("asr_engine"))
         self.flip.toggled.connect(lambda _c: self._commit("flip"))
 
-    def set_document(self, doc: VideoDoc | None, project_whisper: str = "") -> None:
+    def set_document(self, doc: VideoDoc | None) -> None:
         self.doc = doc
         if doc is None:
             return
@@ -256,9 +256,7 @@ class VideoSettingsPanel(QtWidgets.QWidget):
         self.srt.set_value(doc.srt_path)
         self.srt.setEnabled(doc.source_mode == "srt")
         self.language.set_value(doc.source_language)
-        models = sorted(set(downloaded_whisper_models() + KNOWN_WHISPER_MODELS))
-        self.whisper.set_items([("", f"Theo project ({project_whisper})")] + [(m, m) for m in models], keep=False)
-        self.whisper.set_value(doc.whisper_model)
+        self.asr_engine.set_value(doc.asr_engine)
         self.flip.setChecked(doc.flip_horizontal)
         self.output.setText(doc.last_output or "Chưa xuất")
         self._loading = False
@@ -273,8 +271,7 @@ class VideoSettingsPanel(QtWidgets.QWidget):
         self.srt.setEnabled(d.source_mode == "srt")
         d.srt_path = self.srt.value()
         d.source_language = self.language.value() or ""
-        value = self.whisper.currentData()
-        d.whisper_model = value if value is not None else self.whisper.currentText().strip()
+        d.asr_engine = self.asr_engine.value()
         d.flip_horizontal = self.flip.isChecked()
         self.changed.emit(field)
 
@@ -514,6 +511,7 @@ class EditorPage(QtWidgets.QWidget):
         s.projectChanged.connect(self._refresh_video_combo)
         s.videoChanged.connect(self._on_job_video_changed)
         s.openVideoRequested.connect(self.open_video)
+        s.videosAboutToBeRemoved.connect(self._on_videos_removed)
         s.flushRequested.connect(self.save_now)
         s.jobs.videoLocksChanged.connect(self._update_lock)
         s.contextChanged.connect(self._refresh_choices)
@@ -606,7 +604,20 @@ class EditorPage(QtWidgets.QWidget):
             self.video_combo.set_value(current)
         self.video_combo.blockSignals(False)
         if self.doc and project and all(v.id != self.doc.id for v in project.videos):
-            self.close_video()
+            self.close_video(save=False)
+
+    def _on_videos_removed(self, video_ids: list[str]) -> None:
+        if self.doc and self.doc.id in video_ids:
+            video_id, store = self.doc.id, self.state.store
+            release = self.close_video(save=False)
+            if release is not None and store is not None:
+                self.state.defer_video_cleanup(store, video_id, release)
+
+    def _is_current_video(self, project_root: Path, video_id: str) -> bool:
+        return bool(
+            self.doc and self.doc.id == video_id
+            and self.state.store and self.state.store.root == project_root
+        )
 
     def _on_video_combo(self, _index: int) -> None:
         video_id = self.video_combo.value()
@@ -626,17 +637,41 @@ class EditorPage(QtWidgets.QWidget):
         for button in self.run_buttons:
             button.setEnabled(False)
 
-    def close_video(self) -> None:
-        self.save_now()
-        self.backend.unload()
+    def close_video(self, save: bool = True, *, shutdown: bool = False) -> Future | None:
+        if save:
+            self.save_now()
+        for timer in (self.save_timer, self.status_timer, self.reload_timer, self.remix_timer):
+            timer.stop()
+        if self.doc and self.state.store:
+            self.state.stop_video_tasks(self.state.store, [self.doc.id])
+        self._preview_version += 1
+        self._preview_path = None
+        self._override_signature = ""
+        self._pending_reload = False
+        self._selected_segment = -1
+        self.dirty = False
         self.doc = None
+        if shutdown:
+            self.backend.close()
+            release = None
+        else:
+            release = self.backend.unload()
+        self.clip_player.stop()
+        self.clip_player.setSource(QtCore.QUrl())
         self.translate_field.set_target(None)
         self.tts_field.set_target(None)
         self.segments = []
         self.canvas.set_document(None, [])
         self.timeline.set_document(None, [])
+        self.timeline.set_peaks([], 20)
         self.table.model_.set_segments([])
+        self.layer_panel.set_document(None)
+        self.audio_panel.set_document(None)
+        self.video_panel.set_document(None)
+        self.segment_panel.show_segment(None)
+        self._update_lock()
         self.set_empty()
+        return release
 
     def open_video(self, video_id: str) -> None:
         store = self.state.store
@@ -676,7 +711,7 @@ class EditorPage(QtWidgets.QWidget):
         self.layer_panel.set_document(doc)
         self.audio_panel.set_document(doc)
         project = self.state.project
-        self.video_panel.set_document(doc, project.whisper_model if project else "")
+        self.video_panel.set_document(doc)
         self.translate_field.set_target(doc, on_save=lambda: self._on_provider_changed("translate"))
         self.tts_field.set_target(doc, on_save=lambda: self._on_provider_changed("tts"))
         self._update_provider_badge()
@@ -704,10 +739,11 @@ class EditorPage(QtWidgets.QWidget):
             self.timeline.set_peaks([], 20)
             return
         video_id = doc.id
-        run_background(
+        task = run_background(
             lambda _p, _s: load_peaks(audio, 20)[0],
-            on_done=lambda peaks: self.doc and self.doc.id == video_id and self.timeline.set_peaks(peaks, 20),
+            on_done=lambda peaks: self._is_current_video(store.root, video_id) and self.timeline.set_peaks(peaks, 20),
         )
+        self.state.track_video_task(store, video_id, task)
 
     def _update_chips(self) -> None:
         if not self.doc:
@@ -731,9 +767,12 @@ class EditorPage(QtWidgets.QWidget):
         store = self.state.store
         if not (self.dirty and self.doc and store) or self.read_only:
             return
+        project = self.state.project
+        if not project or not any(ref.id == self.doc.id for ref in project.videos):
+            self.dirty = False
+            return
         store.save_video(self.doc)
         store.save_segments(self.doc.id, self.segments)
-        project = self.state.project
         if project:
             for ref in project.videos:
                 if ref.id == self.doc.id and (ref.name != self.doc.name or ref.source_path != self.doc.source_path):
@@ -875,7 +914,7 @@ class EditorPage(QtWidgets.QWidget):
 
         def finish(path) -> None:
             self._remix_running = False
-            if self.doc is None or self.doc.id != video_id or version != self._preview_version:
+            if not self._is_current_video(store.root, video_id) or version != self._preview_version:
                 return  # đã có thay đổi mới hơn → lượt sau sẽ dùng
             self._preview_path = Path(path)
             self._apply_audio_override()
@@ -888,10 +927,12 @@ class EditorPage(QtWidgets.QWidget):
 
         def fail(message: str) -> None:
             self._remix_running = False
+            if not self._is_current_video(store.root, video_id) or version != self._preview_version:
+                return
             self._update_player_note()
             self.player_label.setText(self.player_label.text() + f" — lỗi trộn: {message[:120]}")
 
-        run_background(work, finish, fail)
+        self.state.track_video_task(store, video_id, run_background(work, finish, fail))
 
     def _on_show_source(self, checked: bool) -> None:
         self.canvas.show_source = checked
@@ -1082,6 +1123,8 @@ class EditorPage(QtWidgets.QWidget):
             return {c.id: c.text for c in chosen}
 
         def done(result: dict) -> None:
+            if not self._is_current_video(ctx.store.root, doc.id):
+                return
             for seg in self.segments:
                 if seg.id in result:
                     seg.text = result[seg.id]
@@ -1089,7 +1132,11 @@ class EditorPage(QtWidgets.QWidget):
             self.window().statusBar().showMessage(f"Đã dịch lại {len(result)} câu", 4000)
 
         self.window().statusBar().showMessage(f"Đang dịch {len(targets)} câu…")
-        run_background(work, done, lambda msg: error(self, msg, "Dịch thất bại"))
+        task = run_background(
+            work, done,
+            lambda msg: self._is_current_video(ctx.store.root, doc.id) and error(self, msg, "Dịch thất bại"),
+        )
+        self.state.track_video_task(ctx.store, doc.id, task)
 
     def _tts_selected(self, targets: list[Segment]) -> None:
         self.save_now()
@@ -1103,21 +1150,27 @@ class EditorPage(QtWidgets.QWidget):
             ctx.stop_event = stop
             chosen = [c for c in copies if c.id in ids]
             _done, failed = run_tts(ctx, doc, copies, chosen, force=True)
-            return {c.id: (c.tts_file, c.tts_duration, c.tts_key) for c in chosen}, failed
+            return {c.id: (c.tts_file, c.tts_duration, c.tts_key, c.tts_error) for c in chosen}, failed
 
         def done(result) -> None:
+            if not self._is_current_video(ctx.store.root, doc.id):
+                return
             data, failed = result
             for seg in self.segments:
                 if seg.id in data:
-                    seg.tts_file, seg.tts_duration, seg.tts_key = data[seg.id]
+                    seg.tts_file, seg.tts_duration, seg.tts_key, seg.tts_error = data[seg.id]
             self._after_bulk_edit("mix")
             message = f"Đã tạo lồng tiếng {len(data) - failed} câu" + (f", {failed} lỗi" if failed else "")
             self.window().statusBar().showMessage(message + " — bấm “Trộn âm” để nghe trong bản trộn", 6000)
-            if len(targets) == 1:
+            if len(targets) == 1 and not failed:
                 self.segment_action("listen", [targets[0].id])
 
         self.window().statusBar().showMessage(f"Đang tạo lồng tiếng {len(targets)} câu…")
-        run_background(work, done, lambda msg: error(self, msg, "Lồng tiếng thất bại"))
+        task = run_background(
+            work, done,
+            lambda msg: self._is_current_video(ctx.store.root, doc.id) and error(self, msg, "Lồng tiếng thất bại"),
+        )
+        self.state.track_video_task(ctx.store, doc.id, task)
 
     def _refresh_tts_status(self) -> None:
         if not (self.doc and self.state.store and self.state.project):
@@ -1265,7 +1318,7 @@ class EditorPage(QtWidgets.QWidget):
         if field == "flip":
             self.mark_dirty("render")
             self.canvas.update()
-        elif field in ("mode", "srt", "language", "whisper"):
+        elif field in ("mode", "srt", "language", "asr_engine"):
             self.mark_dirty("asr")
         elif field == "source":
             self.mark_dirty("asr")
@@ -1354,14 +1407,19 @@ class EditorPage(QtWidgets.QWidget):
             return run_render(ctx, doc, segments, mix, start=start, length=15.0)
 
         def done(path) -> None:
+            if not self._is_current_video(ctx.store.root, doc.id):
+                return
             self.window().statusBar().showMessage(f"Đã xuất thử: {path}", 6000)
             open_path(str(path))
 
         self.window().statusBar().showMessage("Đang xuất thử 15 giây…")
-        run_background(
-            work, done, lambda msg: error(self, msg, "Xuất thử thất bại"),
-            lambda pct, msg: self.window().statusBar().showMessage(f"Xuất thử: {pct:.0f}%"),
+        task = run_background(
+            work, done,
+            lambda msg: self._is_current_video(ctx.store.root, doc.id) and error(self, msg, "Xuất thử thất bại"),
+            lambda pct, msg: self._is_current_video(ctx.store.root, doc.id)
+            and self.window().statusBar().showMessage(f"Xuất thử: {pct:.0f}%"),
         )
+        self.state.track_video_task(ctx.store, doc.id, task)
 
     def save_as_template(self) -> None:
         project = self.state.project
@@ -1442,4 +1500,4 @@ class EditorPage(QtWidgets.QWidget):
             self.state.settings.window_state["editor_upper"] = self.upper_splitter.sizes()
             self.state.settings.window_state["editor_body"] = self.body.sizes()
         self.save_now()
-        self.backend.close()
+        self.close_video(save=False, shutdown=True)

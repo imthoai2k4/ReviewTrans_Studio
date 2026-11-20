@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 MODULES = [
-    "requests", "openai", "anthropic", "google.genai", "edge_tts", "py7zr",
+    "requests", "openai", "anthropic", "google.genai", "py7zr",
     "PyQt6.QtWidgets", "PyQt6.QtMultimedia", "reviewtrans.ui.player.qt_backend",
     "reviewtrans.ui.main_window", "reviewtrans.core.pipeline.runner",
 ]
@@ -38,9 +38,24 @@ def run(output: Path, require: list[str]) -> int:
         if "libmpv" in require:
             ok = False
     result["tools"] = tool_status()
+    if "funasr" in require:
+        from .core.pipeline.funasr import models_ready, worker_command
+
+        asr_report = output.with_name(output.stem + ".funasr.json")
+        try:
+            code = subprocess.run([*worker_command(), "--check", "--output", str(asr_report)],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  timeout=120, **subprocess_kwargs()).returncode
+            result["funasr"] = json.loads(asr_report.read_text(encoding="utf-8")) if asr_report.is_file() else {}
+            result["funasr"]["models_ready"] = models_ready()
+            if code or not models_ready():
+                ok = False
+        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+            result["funasr"] = {"error": str(exc)}
+            ok = False
     result["runs"] = {}
     for tool in require:
-        if tool == "libmpv":
+        if tool in ("libmpv", "funasr"):
             continue
         path = result["tools"].get(tool)
         if not path:

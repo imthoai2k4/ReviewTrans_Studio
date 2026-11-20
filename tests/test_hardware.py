@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import pytest
 
 from reviewtrans.core import hardware
-from reviewtrans.core.config import SettingsStore, upgrade_settings, whisper_thread_count
-from reviewtrans.core.hardware import EncoderConfig, Gpu, HardwareInfo, quality_args, resolve_encoder, whisper_plan
+from reviewtrans.core.config import SETTINGS_VERSION, SettingsStore, upgrade_settings, asr_thread_count
+from reviewtrans.core.hardware import EncoderConfig, Gpu, HardwareInfo, quality_args, resolve_encoder
 from reviewtrans.core.paths import find_tool
 from reviewtrans.core.pipeline import RunContext
 from reviewtrans.core.pipeline import asr as asr_mod
@@ -42,8 +45,41 @@ def test_resolve_encoder_prefers_gpu_and_falls_back():
     assert resolve_encoder("libx265", info)[0].codec == "libx265"
     assert resolve_encoder("auto", info, {"h264_amf"})[0].codec == "h264_mf"  # vừa lỗi trong lần xuất này
     assert resolve_encoder("auto", info)[0].codec == "h264_amf"  # lần sau vẫn thử lại
-    hardware.mark_failed("h264_amf")  # lỗi khi xuất thật → phiên này bỏ qua
-    assert resolve_encoder("auto", info)[0].codec == "h264_mf"
+
+
+def test_auto_prefers_discrete_gpu_to_integrated():
+    info = HardwareInfo(encoders={
+        "h264_amf": EncoderConfig("h264_amf", device="Radeon Graphics"),
+        "h264_qsv": EncoderConfig("h264_qsv", device="Intel Arc", discrete=True),
+    })
+    assert resolve_encoder("auto", info)[0].codec == "h264_qsv"
+    assert resolve_encoder("auto", info, {"h264_qsv"})[0].codec == "h264_amf"
+
+
+def test_detect_nvenc_with_compatible_ffmpeg(tmp_path, monkeypatch):
+    primary = tmp_path / "primary" / "ffmpeg.exe"
+    alternate = tmp_path / "alternate" / "ffmpeg.exe"
+    for exe in (primary, alternate):
+        exe.parent.mkdir()
+        exe.touch()
+    monkeypatch.setattr(hardware, "IS_WINDOWS", True)
+    monkeypatch.setenv("PATH", os.pathsep.join(str(exe.parent) for exe in (primary, alternate)))
+    monkeypatch.setattr(hardware, "find_tool", lambda name: primary)
+    monkeypatch.setattr(hardware, "cache_path", lambda: tmp_path / "hardware.json")
+    monkeypatch.setattr(hardware, "list_gpus", lambda exe: [Gpu("Quadro T1000", "nvidia", 0)])
+    monkeypatch.setattr(hardware, "nvidia_details", lambda: ("13.0", "581.32", "7.5", []))
+    monkeypatch.setattr(hardware, "_encoder_list", lambda exe: {"h264_nvenc"})
+    mismatch = hardware.NVENC_API_MISMATCH
+    monkeypatch.setattr(hardware, "probe_encoder", lambda exe, config: (False, mismatch) if exe == primary else (True, ""))
+
+    info = hardware.detect(force=True)
+    encoder, _ = resolve_encoder("auto", info)
+    assert (encoder.codec, encoder.device, encoder.ffmpeg) == ("h264_nvenc", "Quadro T1000", str(alternate))
+    hardware.forget()
+    assert hardware.load_cached().encoders[encoder.codec] == encoder
+    alternate.unlink()
+    hardware.forget()
+    assert hardware.load_cached() is None
 
 
 def test_amf_tries_discrete_gpu_first():
@@ -56,50 +92,16 @@ def test_amf_tries_discrete_gpu_first():
     assert hardware._candidates("h264_nvenc", gpus) == []  # không có card NVIDIA thì khỏi thử
 
 
-def test_cuda_package_choice():
-    assert hardware.cuda_package(HardwareInfo(compute_cap="8.6", cuda_version="12.8")) == "11.8.0"  # RTX 30
-    assert hardware.cuda_package(HardwareInfo(compute_cap="8.9", cuda_version="12.6")) == "12.4.0"  # RTX 40
-    assert hardware.cuda_package(HardwareInfo(compute_cap="12.0", cuda_version="12.2")) == "11.8.0"
-    assert hardware.cuda_package(None) == "11.8.0"
-
-
 def test_settings_upgrade_to_auto(home):
     store = SettingsStore()
     s = store.settings
-    s.render.video_codec, s.whisper_threads = "libx264", 4
+    s.render.video_codec, s.asr_threads = "libx264", 4
     upgrade_settings(s, 1)
-    assert s.render.video_codec == "auto" and s.whisper_threads == 0 and s.settings_version == 2
+    assert s.render.video_codec == "auto" and s.asr_threads == 0 and s.settings_version == SETTINGS_VERSION
     s.render.video_codec = "libx264"  # người dùng tự chọn lại CPU → giữ nguyên
     upgrade_settings(s, 2)
     assert s.render.video_codec == "libx264"
-    assert whisper_thread_count(0) >= 1 and whisper_thread_count(6) == 6
-
-
-def _fake_whisper(folder, name="whisper-cli.exe"):
-    folder.mkdir(parents=True, exist_ok=True)
-    exe = folder / name
-    exe.write_bytes(b"")
-    return exe
-
-
-def test_whisper_plan_order(tmp_path, home, monkeypatch):
-    extra = tmp_path / "extra"
-    vulkan = _fake_whisper(extra / "whisper-vulkan")
-    cuda = _fake_whisper(extra / "whisper-cuda")
-    cpu = _fake_whisper(extra)
-    monkeypatch.setattr(hardware, "bin_dirs", lambda: [extra])
-    monkeypatch.setattr(hardware, "find_tool", lambda name: cpu if name == "whisper" else None)
-    amd = HardwareInfo(gpus=[Gpu("RX", "amd", 1)])
-    nvidia = HardwareInfo(gpus=[Gpu("RTX 3060", "nvidia", 0)], nvidia_driver="560")
-    assert [(n, p) for n, p, _ in whisper_plan("auto", amd)] == [("vulkan", vulkan), ("cpu", cpu)]
-    assert [(n, p) for n, p, _ in whisper_plan("auto", nvidia)] == [("cuda", cuda), ("vulkan", vulkan), ("cpu", cpu)]
-    assert [n for n, _, _ in whisper_plan("cpu", nvidia)] == ["cpu"]
-    assert [n for n, _, _ in whisper_plan("auto", HardwareInfo())] == ["cpu"]  # không có GPU
-    assert [n for n, _, _ in whisper_plan("cuda", amd)] == ["cuda", "cpu"]
-    # chỉ có bản GPU: dự phòng bằng chính nó với -ng
-    monkeypatch.setattr(hardware, "find_tool", lambda name: None)
-    plan = whisper_plan("auto", amd)
-    assert plan[-1] == ("cpu", vulkan, ["-ng"])
+    assert asr_thread_count(0) >= 1 and asr_thread_count(6) == 6
 
 
 def _ctx(tmp_path):
@@ -107,36 +109,6 @@ def _ctx(tmp_path):
     store, project = ProjectStore.create(tmp_path / "projects", "HW")
     logs: list[str] = []
     return RunContext(store=store, project=project, settings=settings, log=logs.append), logs
-
-
-def test_asr_falls_back_to_cpu(tmp_path, home, monkeypatch):
-    ctx, logs = _ctx(tmp_path)
-    source = tmp_path / "a.mp4"
-    source.write_bytes(b"x")
-    info = MediaInfo(duration=5.0, width=640, height=360, fps=25.0, has_audio=True)
-    doc = ctx.store.add_video(ctx.project, str(source), info)
-    gpu, cpu = tmp_path / "gpu.exe", tmp_path / "cpu.exe"
-    monkeypatch.setattr(asr_mod, "whisper_plan", lambda device, info: [("vulkan", gpu, []), ("cpu", cpu, [])])
-    monkeypatch.setattr(asr_mod, "ensure_whisper_model", lambda *a, **k: tmp_path / "model.bin")
-    monkeypatch.setattr(asr_mod, "extract_audio", lambda *a: tmp_path / "audio.wav")
-    calls = []
-
-    def fake_run(command, log=None, stop_event=None, line_cb=None, quiet=False, cwd=None):
-        calls.append(command[0])
-        if command[0] == str(gpu):
-            line_cb("ggml_vulkan: 0 = Radeon RX 5300M (AMD proprietary driver)")
-            return 0xC0000005  # crash của driver
-        out = command[command.index("-of") + 1]
-        with open(out + ".srt", "w", encoding="utf-8") as handle:
-            handle.write("1\n00:00:00,000 --> 00:00:01,000\nxin chào\n")
-        return 0
-
-    monkeypatch.setattr(asr_mod, "run", fake_run)
-    segments = asr_mod.run_asr(ctx, doc)
-    assert [s.source for s in segments] == ["xin chào"]
-    assert calls == [str(gpu), str(cpu)]
-    assert any("Radeon RX 5300M" in line for line in logs)
-    assert any("thử bản CPU" in line for line in logs)
 
 
 def _video(ctx, tmp_path):
@@ -172,6 +144,28 @@ def test_render_gpu_failure_retries_on_cpu(tmp_path, home, monkeypatch):
     assert info.has_video and abs(info.duration - 3) < 0.5
     assert any("xuất lại bằng libx264" in line for line in logs), logs[-10:]
     assert "h264_nvenc" in calls[-1]
+
+
+@needs_ffmpeg
+def test_render_failure_preserves_previous_output(tmp_path, home, monkeypatch):
+    ctx, _ = _ctx(tmp_path)
+    ctx.settings.render.video_codec = "libx264"
+    doc = _video(ctx, tmp_path)
+    sound = tmp_path / "mix.wav"
+    sound.touch()
+    out = tmp_path / "out.mp4"
+    out.write_bytes(b"previous output")
+
+    def fail(command, *, line_cb, **kwargs):
+        Path(command[-1]).touch()
+        line_cb("[decoder] Invalid video source")
+        return 1
+
+    monkeypatch.setattr(render_mod, "run", fail)
+    with pytest.raises(RuntimeError, match="Invalid video source"):
+        render_mod.run_render(ctx, doc, [], sound, output=out)
+    assert out.read_bytes() == b"previous output"
+    assert not list(out.parent.glob(".render-*"))
 
 
 @needs_ffmpeg

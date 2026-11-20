@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# code nội bộ -> (tên hiển thị, tên tiếng Anh cho LLM, Google, Microsoft, Whisper)
+# code nội bộ -> (tên hiển thị, tên tiếng Anh cho LLM, Google, Microsoft, ASR)
 LANGUAGES: dict[str, tuple[str, str, str, str, str]] = {
     "auto": ("Tự nhận diện", "the source language", "auto", "", "auto"),
     "zh": ("Tiếng Trung (giản thể)", "Simplified Chinese", "zh-CN", "zh-Hans", "zh"),
@@ -42,6 +42,6 @@ def microsoft_code(code: str) -> str:
     return entry[3] if entry else code
 
 
-def whisper_code(code: str) -> str:
+def asr_language_code(code: str) -> str:
     entry = LANGUAGES.get(code)
     return entry[4] if entry else code

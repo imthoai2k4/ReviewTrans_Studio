@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import threading
 import time
 from pathlib import Path
@@ -49,42 +48,6 @@ def _download(url: str, target: Path) -> Path:
     response.raise_for_status()
     target.write_bytes(response.content)
     return target
-
-
-class EdgeTTS(TTSProvider):
-    default_voice = "vi-VN-HoaiMyNeural"
-    _voices_cache: list[dict] | None = None
-
-    def synthesize(self, text, voice, speed, out_base, stop_event=None):
-        import edge_tts
-
-        _check_stop(stop_event)
-        target = out_base.with_suffix(".mp3")
-        rate = f"{int(round((speed - 1.0) * 100)):+d}%"
-        pitch = f"{int(float(self.profile.option('pitch_hz', 0))):+d}Hz"
-
-        async def _run():
-            communicate = edge_tts.Communicate(text, voice or self.voice, rate=rate, pitch=pitch)
-            await communicate.save(str(target))
-
-        asyncio.run(_run())
-        if not target.exists() or target.stat().st_size == 0:
-            raise ProviderError("Edge TTS không trả về âm thanh")
-        return target
-
-    def list_voices(self, language: str = ""):
-        import edge_tts
-
-        if EdgeTTS._voices_cache is None:
-            EdgeTTS._voices_cache = asyncio.run(edge_tts.list_voices())
-        voices = []
-        for item in EdgeTTS._voices_cache:
-            locale = item.get("Locale", "")
-            if language and not locale.lower().startswith(language.split("-")[0].lower()):
-                continue
-            label = f"{item.get('ShortName')} ({item.get('Gender', '')})"
-            voices.append((item.get("ShortName", ""), label))
-        return voices + super().list_voices(language)
 
 
 class VbeeTTS(TTSProvider):
@@ -282,7 +245,6 @@ class LegacyCustomTTS(TTSProvider):
 
 
 _KINDS: dict[str, type[TTSProvider]] = {
-    "edge": EdgeTTS,
     "vbee": VbeeTTS,
     "openai_speech": OpenAISpeechTTS,
     "legacy_custom": LegacyCustomTTS,

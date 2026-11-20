@@ -1,5 +1,9 @@
 # Hướng dẫn sử dụng ReviewTrans Studio
 
+**ASR tiếng Trung:** app hỗ trợ Paraformer-zh + FSMN-VAD + CT-Punc để lấy SRT,
+ưu tiên khi chọn bộ nhận dạng Tự động và ngôn ngữ gốc tiếng Trung.
+Xem [cài đặt, cách chọn engine và giới hạn](asr-paraformer.md).
+
 ReviewTrans Studio dịch, lồng tiếng và chèn phụ đề tự động cho video review phim / video thuyết minh.
 Tài liệu này đi qua toàn bộ tính năng, ảnh minh hoạ lấy từ project mẫu **bomnguyentu** (video giải thích bom
 nguyên tử, tiếng Trung → tiếng Việt, 375 câu).
@@ -15,7 +19,7 @@ nguyên tử, tiếng Trung → tiếng Việt, 375 câu).
 7. [Editor](#7-editor)
 8. [Quy trình xử lý một video](#8-quy-trình-xử-lý-một-video)
 9. [Hàng đợi](#9-hàng-đợi)
-10. [Preset phụ đề](#10-preset-phụ-đề)
+10. [Mẫu phụ đề trong Editor](#10-mẫu-phụ-đề-trong-editor)
 11. [Tài nguyên](#11-tài-nguyên)
 12. [Công cụ: ghép video](#12-công-cụ-ghép-video)
 13. [Cài đặt chung](#13-cài-đặt-chung)
@@ -41,14 +45,13 @@ python -m venv .venv
 .venv\Scripts\python main.py
 ```
 
-> Bản cài đặt đã kèm sẵn FFmpeg, whisper.cpp và libmpv. Khi chạy từ mã nguồn thì tải chúng ở trang **Tài nguyên** (mục 11).
+> Bản cài đặt đã kèm sẵn FFmpeg và libmpv. Khi chạy từ mã nguồn thì tải chúng ở trang **Tài nguyên** (mục 11).
 
 ## 2. Chuẩn bị lần đầu
 
 Làm theo thứ tự dưới đây là dùng được ngay:
 
-1. **Tài nguyên**: kiểm tra FFmpeg, whisper.cpp, libmpv đều có dấu ✓, rồi tải **model Whisper** (khuyên dùng `small`
-   hoặc `medium`; muốn chính xác cao thì dùng `large-v3-turbo`).
+1. **Tài nguyên**: kiểm tra FFmpeg, libmpv và cài **Paraformer-zh + FSMN-VAD + CT-Punc**.
 2. **Providers**: thêm provider dịch (ví dụ API kiểu OpenAI) và provider lồng tiếng, bấm **Kiểm tra kết nối**,
    rồi **Đặt mặc định**.
 3. **Project**: tạo project, thêm video.
@@ -108,6 +111,8 @@ dùng chung ngữ cảnh dịch.
 - **Mở…**: mở một thư mục project có sẵn, ví dụ project được chép từ máy khác.
 - **Thêm video…** hoặc **kéo thả file video** vào bảng. Video được sắp xếp theo tên tự nhiên (Tập 2 đứng trước Tập 10).
 - **▲ ▼**: đổi thứ tự tập. Thứ tự này quyết định thứ tự cập nhật ngữ cảnh khi chạy hàng loạt.
+- Tích ô **Chọn** ở từng dòng để chọn các video cần xử lý; **Chọn tất cả** (Ctrl+A) chọn toàn bộ, **Bỏ chọn** bỏ các ô đã tích.
+- Nút **Xoá** bỏ các video đã chọn khỏi project và dọn dữ liệu dịch/lồng tiếng ở nền. File video gốc được giữ nguyên.
 - Các cột **Nhận dạng / Dịch / Lồng tiếng / Trộn âm / Xuất video** cho biết trạng thái từng bước:
   `● xong`, `◐ cũ` (cần chạy lại vì dữ liệu đã đổi), `✕ lỗi` (rê chuột để xem lỗi), `○` chưa chạy.
 - **Chạy hàng loạt**: tích các bước cần chạy, chọn **Chạy video đã chọn** hoặc **Chạy tất cả video**.
@@ -319,35 +324,51 @@ Mỗi bước được lưu lại (cache). Sửa một câu chỉ làm câu đó
 
 ## 9. Hàng đợi
 
+Nhận dạng dùng VAD để phát hiện vùng lời nói và căn mốc từng từ về thời gian video gốc,
+tránh kéo phụ đề qua khoảng lặng. Model VAD nhỏ được tải tự động khi cần.
+Khi dịch, ứng dụng gửi kèm thời lượng câu để ưu tiên cách diễn đạt ngắn vừa thời gian đọc.
+
+Lồng tiếng kiểm tra cả file mới và cache: voice gần im lặng hoặc ngắn bất thường so với nội dung
+được tạo lại tối đa 3 lần. Nếu vẫn không đạt, ứng dụng báo lỗi câu đó và giữ kết quả cũ;
+không đánh dấu hoàn thành. Kiểm tra này phát hiện thời lượng và năng lượng bất thường,
+không bảo đảm nhận biết mọi trường hợp TTS đọc sai hoặc thiếu một từ.
+Log trộn âm báo câu bị chồng tiếng; voice vượt cuối video sẽ chặn xuất để tránh cắt mất đuôi.
+Hãy dịch gọn hoặc điều chỉnh tốc độ cho các câu được báo.
+
+Với video đã xử lý bằng phiên bản cũ, chạy một lượt mới từ **Nhận dạng → Dịch → Lồng tiếng → Trộn âm → Xuất video**
+để thay mốc thời gian và âm thanh cũ. Các file video đã xuất trước đó không tự thay đổi.
+
 ![Hàng đợi](images/20-queue.png)
 
 *Ảnh minh hoạ: dòng thứ hai là job ví dụ.*
 
 - Mọi việc chạy nền đều nằm ở đây, **lần lượt theo thứ tự thêm vào**. Nhờ vậy ngữ cảnh được cập nhật theo đúng thứ tự tập.
-- Chọn một dòng để xem log chi tiết. Chuột phải để *Huỷ/dừng*, *Chạy lại* hoặc *Chép log* (gửi kèm khi báo lỗi).
+- **Dừng**: dừng bước đang xử lý của video hiện tại và giữ các video còn lại trong hàng đợi.
+- **Tiếp tục**: tiếp tục từ bước đã dừng, giữ các bước và câu dịch/lồng tiếng đã hoàn thành, rồi xử lý lần lượt các video còn lại.
+  Nếu dừng trong lúc nhận dạng hoặc xuất video, bước đó được chạy lại; các bước trước vẫn được giữ.
+- Chọn một dòng để xem log chi tiết. Chuột phải để *Dừng*, *Tiếp tục*, *Huỷ* việc đang chờ, *Chạy lại* hoặc *Chép log* (gửi kèm khi báo lỗi).
+- Tích ô **Chọn** để chọn nhiều video, hoặc dùng **Chọn tất cả** (`Ctrl+A`) / **Bỏ chọn**. Có thể chọn nhiều dòng bằng `Ctrl`/`Shift`.
+- **Xoá đã chọn** (phím `Delete` hoặc menu chuột phải) gỡ video khỏi hàng đợi, giữ nguyên file và dữ liệu project.
+  Nếu có video đang chạy trong phần đã chọn, bấm **Dừng** và đợi dừng hẳn trước khi xoá.
+- **Xoá việc đã xong** dọn các việc đã kết thúc; giữ các video đang chờ hoặc đã dừng để tiếp tục.
 - Video đang được xử lý bị **khoá chỉnh sửa** trong Editor (có dải thông báo màu cam); dữ liệu tự cập nhật khi xong.
 - Thanh trạng thái dưới cùng cửa sổ luôn hiện tiến độ của việc đang chạy.
 
-## 10. Preset phụ đề
+## 10. Mẫu phụ đề trong Editor
 
-![Preset](images/16-presets.png)
-
-Lưu các kiểu phụ đề hay dùng (có sẵn: Review cổ điển, Vàng viền đen, Hộp nền mờ, Short/TikTok). Sửa ở cột phải,
-xem trước ở giữa. Áp preset trong Editor ở tab Phụ đề.
+Vào **Editor → Phụ đề** để chỉnh font, viền, bóng, hộp nền, vị trí và lề, đồng thời xem trước ngay trên video.
+Chọn mẫu rồi bấm **Áp**, hoặc bấm **Lưu preset** để lưu kiểu hiện tại. Lưu cùng tên để cập nhật mẫu,
+lưu bằng tên khác để tạo mẫu mới. Các mẫu đã lưu và mẫu có sẵn (Review cổ điển, Vàng viền đen,
+Hộp nền mờ, Short/TikTok) được dùng trực tiếp tại đây và trong cài đặt chạy hàng loạt.
 
 ## 11. Tài nguyên
 
 ![Tài nguyên](images/17-resources.png)
 
-- **Công cụ**: FFmpeg (bắt buộc), whisper.cpp (nhận dạng), libmpv (player mượt hơn, tua chính xác). Bấm
+- **Công cụ**: FFmpeg (bắt buộc), libmpv (player mượt hơn, tua chính xác). Bấm
   **Tải / cập nhật** để tải bản mới. Sau khi tải libmpv, khởi động lại app.
-- **whisper.cpp chạy bằng GPU** (tuỳ chọn, nhận dạng nhanh gấp nhiều lần CPU):
-  - **CUDA (NVIDIA)**: bản chính thức của whisper.cpp. App tự chọn gói phù hợp với card: ≈270 MB cho GTX 900 → RTX 30,
-    ≈680 MB cho RTX 40/50.
-  - **Vulkan (AMD / Intel / NVIDIA)**: chạy trên mọi card có driver Vulkan. Bản cài đặt đã kèm sẵn bản này.
-  - Tải xong, app tự dùng GPU cho bước Nhận dạng. Nếu bản GPU lỗi (driver cũ, thiếu VRAM…), app tự chạy lại bằng CPU.
-- **Model Whisper**: *Lấy danh sách đầy đủ* từ Hugging Face, chọn rồi *Tải model đã chọn*.
-  Model càng lớn càng chính xác nhưng càng chậm; bản `-q5` nhẹ hơn.
+- **Paraformer**: chọn CPU/CUDA/Tự động, bấm **Cài bộ nhận dạng + tải model**.
+  Nhận dạng tiếng Trung/Anh; ngôn ngữ khác dùng SRT có sẵn.
 - **Lưu trữ**: xem dung lượng cache của project, **dọn cache** (giữ lại file lồng tiếng từng câu), mở thư mục dữ liệu
   và **thư mục font**. Font chép vào thư mục font dùng được cho cả khung phát lẫn video xuất (khởi động lại app để khung phát nhận font mới).
 
@@ -365,20 +386,21 @@ Video khác định dạng thì tích **Mã hoá lại**.
 
 - Thư mục chứa project, ngôn ngữ mặc định.
 - **Player**: tự động (libmpv nếu có), libmpv hoặc Qt. Đổi xong cần khởi động lại.
-- Model Whisper mặc định, **Whisper chạy trên** (Tự động / CUDA / Vulkan / Chỉ CPU), số luồng CPU của Whisper
+- **Paraformer chạy trên** (Tự động / CUDA / Chỉ CPU), số luồng CPU nhận dạng
   (*Tự động* = theo số nhân CPU), **số câu mỗi lần dịch** (giảm nếu LLM hay trả thiếu dòng), số luồng TTS song song.
 - **Xuất video**:
-  - Codec: mặc định **Tự động H.264**, tức dùng bộ mã hoá GPU nếu máy có, không thì dùng CPU (x264). Có thể chọn cụ thể:
+  - Codec: mặc định **Tự động H.264**, ưu tiên GPU rời để mã hoá, sau đó thử GPU tích hợp hoặc CPU (x264). Có thể chọn cụ thể:
     NVIDIA NVENC, AMD AMF, Intel Quick Sync, Windows Media Foundation (mọi GPU), hoặc x264/x265 bằng CPU.
     *Tự động H.265* cho file nhỏ hơn.
   - CRF/CQ: nhỏ = đẹp hơn, 18–23 là hợp lý. Áp dụng cho cả bộ mã hoá GPU.
   - Preset (chỉ cho x264/x265) và bitrate âm thanh.
-  - *Giải mã video nguồn bằng GPU*: thường không nhanh hơn nhiều vì các bước làm mờ/chèn phụ đề vẫn chạy trên CPU.
+  - CPU mặc định giải mã nguồn, xử lý lớp hình, chèn phụ đề và trộn âm. Tuỳ chọn *Thử dùng GPU để giải mã video nguồn* có thể bật cho nguồn tương thích. Với MP4 ByteVC2 được hỗ trợ, app chuẩn hoá bản tạm sang VVC và giải mã bằng CPU.
 - **Tăng tốc phần cứng**: danh sách GPU, các bộ mã hoá GPU **đã chạy thử thành công** trên máy, bộ mã hoá sẽ dùng
-  khi xuất, và các bản whisper đang có. Bấm **Dò lại phần cứng** sau khi đổi card hoặc cập nhật driver.
+  khi xuất. Bấm **Dò lại phần cứng** sau khi đổi card hoặc cập nhật driver.
 
 > Ví dụ trên laptop Radeon RX 5300M: xuất 60 giây video 1080p có vùng che mờ mất 13 giây bằng AMF, còn x264 (CPU) mất 27 giây.
 > Nếu GPU lỗi giữa chừng khi xuất, app tự thử lại, rồi chuyển sang bộ mã hoá GPU khác hoặc CPU, không cần làm gì thêm.
+> Nếu driver NVIDIA chưa hỗ trợ phiên bản NVENC của FFmpeg đi kèm, app có thể dùng bản FFmpeg trong PATH sau khi chạy thử NVENC thành công.
 
 ## 14. Phím tắt
 
@@ -410,17 +432,17 @@ Kiểm tra chế độ đang là *Nghe: bản trộn*, và đợi dòng “đang
 **Khung phát đen hoặc giật?**
 Vào Tài nguyên tải libmpv rồi khởi động lại. Nếu vẫn lỗi, chọn Player = Qt Multimedia trong Cài đặt.
 
-**Không nhận dạng được (Whisper lỗi)?**
-Kiểm tra whisper.cpp và model ở trang Tài nguyên, và chọn đúng ngôn ngữ gốc. Video không có tiếng nói rõ
-(chỉ có nhạc) thì Whisper có thể trả về rất ít câu.
+**Không nhận dạng được (Paraformer lỗi)?**
+Kiểm tra bộ nhận dạng Paraformer và ba model ở trang Tài nguyên, và chọn đúng ngôn ngữ gốc. Video không có tiếng nói rõ
+(chỉ có nhạc) thì Paraformer có thể trả về rất ít câu.
 
 **Xuất video không dùng GPU / log ghi “… chạy thử lỗi”?**
 Vào Cài đặt → Tăng tốc phần cứng xem bộ mã hoá nào dùng được, bấm *Dò lại phần cứng* sau khi cập nhật driver card màn hình.
 Laptop hai GPU AMD với driver cũ đôi khi từ chối mở AMF; khi đó app dùng Media Foundation hoặc CPU thay thế.
 
 **Nhận dạng vẫn chạy bằng CPU?**
-Log của job ghi rõ bản whisper đang dùng (dòng *Whisper chạy bằng …*). Tải bản CUDA/Vulkan ở trang Tài nguyên.
-Nếu log có *Whisper Vulkan lỗi → thử bản CPU*, hãy cập nhật driver card màn hình, hoặc chọn *Chỉ CPU* trong Cài đặt.
+Log của job ghi thiết bị `cuda:0` hoặc `cpu`. Để dùng GPU NVIDIA, cài bản CUDA trong
+Tài nguyên và chọn CUDA hoặc Tự động. Kiểm tra driver nếu CUDA không khả dụng.
 
 **Phụ đề trong video xuất dùng sai font?**
 Font cần được cài vào Windows, hoặc chép vào *thư mục font* (Tài nguyên → Thư mục font).

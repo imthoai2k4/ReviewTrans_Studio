@@ -201,6 +201,8 @@ def test_preview_remix_follows_original_volume(qapp, home, tmp_path, monkeypatch
     window = MainWindow(state)
     state.create_project(tmp_path / "projects", "Vol")
     doc = state.store.add_video(state.project, str(source), probe(source))
+    doc.audio.original_volume = 100
+    state.store.save_video(doc)
     state.reload_project()
     state.openVideoRequested.emit(doc.id)
     editor = window.pages["editor"]

@@ -3,13 +3,15 @@ from __future__ import annotations
 import json
 import subprocess
 import threading
+from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, TypeVar
 
 from .paths import IS_WINDOWS, find_tool
 
 LogFn = Callable[[str], None]
+T = TypeVar("T")
 
 
 class StopRequested(Exception):
@@ -18,6 +20,44 @@ class StopRequested(Exception):
 
 class ToolMissing(FileNotFoundError):
     pass
+
+
+def call_interruptibly(
+    fn: Callable[[], T],
+    stop_event: threading.Event | None,
+    discard: Callable[[T], None] | None = None,
+) -> T:
+    """Ngừng chờ API ngay khi dừng; kết quả về muộn không được dùng tiếp."""
+    if stop_event is None:
+        return fn()
+    if stop_event.is_set():
+        raise StopRequested()
+    future: Future[T] = Future()
+    finished = threading.Event()
+
+    def request() -> None:
+        try:
+            future.set_result(fn())
+        except Exception as exc:  # noqa: BLE001
+            future.set_exception(exc)
+        finally:
+            finished.set()
+
+    def discard_result(done: Future[T]) -> None:
+        try:
+            if discard:
+                discard(done.result())
+        except Exception:  # noqa: BLE001 - chỉ dọn kết quả đã bỏ
+            pass
+
+    threading.Thread(target=request, name="provider-api", daemon=True).start()
+    while not finished.wait(0.05):
+        if stop_event.is_set():
+            break
+    if stop_event.is_set():
+        future.add_done_callback(discard_result)
+        raise StopRequested()
+    return future.result()
 
 
 def subprocess_kwargs() -> dict:
@@ -52,8 +92,11 @@ def run(
     cwd: str | Path | None = None,
     line_cb: Callable[[str], None] | None = None,
     quiet: bool = False,
+    env: dict[str, str] | None = None,
 ) -> int:
     """Chạy lệnh, stream output ra log. Trả về return code, raise StopRequested khi bị dừng."""
+    if stop_event is not None and stop_event.is_set():
+        raise StopRequested()
     if log and not quiet:
         log("$ " + " ".join(_quote(part) for part in command))
     process = subprocess.Popen(
@@ -65,6 +108,7 @@ def run(
         encoding="utf-8",
         errors="replace",
         cwd=str(cwd) if cwd else None,
+        env=env,
         **subprocess_kwargs(),
     )
     if stop_event is not None:

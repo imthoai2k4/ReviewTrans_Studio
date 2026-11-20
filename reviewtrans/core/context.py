@@ -118,6 +118,10 @@ def extract_json(text: str):
     fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.S)
     if fence:
         text = fence.group(1).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
     for opener, closer in (("{", "}"), ("[", "]")):
         start = text.find(opener)
         end = text.rfind(closer)

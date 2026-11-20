@@ -54,6 +54,9 @@ class QtPlayerBackend(PlayerBackend):
         self.player.stop()
         self.player.setSource(QtCore.QUrl())
         self.ext_player.stop()
+        self.ext_player.setSource(QtCore.QUrl())
+        self._override = None
+        self.audio.setMuted(False)
         self.frame = None
         self.frameUpdated.emit()
 

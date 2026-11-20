@@ -218,7 +218,7 @@ def test_resolve_priority_video_project_global():
     from reviewtrans.core.config import AppSettings, ProviderProfile
     from reviewtrans.core.resolve import resolve
 
-    g = ProviderProfile(id="g", name="G", kind="google")
+    g = ProviderProfile(id="g", name="G", kind="gemini")
     o = ProviderProfile(id="o", name="O", kind="openai", model="m-profile")
     a = ProviderProfile(id="a", name="A", kind="anthropic")
     settings = AppSettings(translate_profiles=[g, o, a], default_translate_profile="o")

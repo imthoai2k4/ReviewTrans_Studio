@@ -2,10 +2,10 @@
 
 Dùng chung cho build.cmd (máy cá nhân) và GitHub Actions.
 
-    python scripts/build.py all [--version 2.1.0] [--no-libmpv] [--no-whisper] [--skip-installer]
+    python scripts/build.py all [--version 2.1.0] [--no-libmpv] [--skip-installer]
     python scripts/build.py tools          # chỉ gom công cụ vào build/tools
     python scripts/build.py app|check|zip|installer
-    python scripts/build.py whisper-vulkan # build whisper.cpp bản Vulkan (cần Vulkan SDK + Visual Studio)
+
 """
 from __future__ import annotations
 
@@ -29,10 +29,6 @@ TOOLS = ROOT / "build" / "tools"
 DIST = ROOT / "dist" / "ReviewTrans"
 RELEASE = ROOT / "release"
 EXE = DIST / "ReviewTrans.exe"
-WHISPER_EXES = ("whisper-cli.exe", "whisper.exe", "main.exe")
-WHISPER_CPP_REF = "v1.9.4"  # phiên bản whisper.cpp dùng để build bản Vulkan
-VULKAN_ZIP = ROOT / "build" / "whisper-vulkan-x64.zip"
-WHISPER_DLL_PREFIXES = ("whisper", "ggml", "sdl2", "libgcc", "libstdc", "libwinpthread", "libgomp", "libomp", "msvcp", "vcruntime")
 
 
 def log(message: str) -> None:
@@ -68,7 +64,7 @@ def _progress(label: str):
 # ------------------------------------------------------------------ công cụ
 
 
-def fetch_tools(with_libmpv: bool = True, with_whisper: bool = True, vulkan_source: str = "") -> None:
+def fetch_tools(with_libmpv: bool = True) -> None:
     from reviewtrans.core.pipeline import resources
 
     TOOLS.mkdir(parents=True, exist_ok=True)
@@ -85,35 +81,6 @@ def fetch_tools(with_libmpv: bool = True, with_whisper: bool = True, vulkan_sour
             resources.download_ffmpeg(_progress("FFmpeg"), bin_dir=TOOLS)
     else:
         log("FFmpeg: đã có")
-
-    # whisper.cpp (ASR)
-    if with_whisper:
-        have = next((TOOLS / n for n in WHISPER_EXES if (TOOLS / n).is_file()), None)
-        if have is None:
-            exe = next((p for p in (_find(n) for n in WHISPER_EXES) if p), None)
-            if exe is None:
-                log("whisper.cpp: đang tải…")
-                staging = Path(tempfile.mkdtemp(prefix="whisper_"))
-                resources.download_whisper_binaries(_progress("whisper.cpp"), bin_dir=staging)
-                exe = next((staging / n for n in WHISPER_EXES if (staging / n).is_file()), None)
-                if exe is None:
-                    raise SystemExit("Gói whisper.cpp không có whisper-cli.exe")
-            else:
-                log(f"whisper.cpp: dùng bản có sẵn ({exe.parent})")
-            downloaded = exe.parent.name.startswith("whisper_")  # gói tải về chỉ chứa whisper → lấy mọi DLL
-            shutil.copy2(exe, TOOLS / exe.name)
-            for dll in exe.parent.glob("*.dll"):
-                if downloaded or dll.name.lower().startswith(WHISPER_DLL_PREFIXES):
-                    shutil.copy2(dll, TOOLS / dll.name)
-        else:
-            log("whisper.cpp: đã có")
-    else:
-        for name in WHISPER_EXES:
-            (TOOLS / name).unlink(missing_ok=True)
-
-    # whisper.cpp Vulkan (ASR bằng GPU AMD/Intel/NVIDIA) — tuỳ chọn, để trong thư mục con riêng
-    if with_whisper:
-        fetch_whisper_vulkan(vulkan_source)
 
     # libmpv (player)
     target = TOOLS / "libmpv-2.dll"
@@ -133,96 +100,6 @@ def fetch_tools(with_libmpv: bool = True, with_whisper: bool = True, vulkan_sour
 
     total = sum(p.stat().st_size for p in TOOLS.rglob("*") if p.is_file())
     log(f"Công cụ trong {TOOLS}: {', '.join(sorted(p.name for p in TOOLS.iterdir()))} ({total / 1e6:.0f} MB)")
-
-
-def fetch_whisper_vulkan(source: str = "") -> None:
-    """Đưa bản whisper.cpp Vulkan vào build/tools/whisper-vulkan.
-
-    Nguồn theo thứ tự: tham số --whisper-vulkan (zip hoặc thư mục) → build/whisper-vulkan-x64.zip
-    → bản đã có → tải từ release của ReviewTrans. Không có thì bỏ qua (app vẫn chạy whisper bằng CPU).
-    """
-    from reviewtrans.core.pipeline import resources
-
-    target = TOOLS / "whisper-vulkan"
-    candidate = Path(source) if source else (VULKAN_ZIP if VULKAN_ZIP.is_file() else None)
-    if candidate is not None and candidate.exists():
-        if target.exists():
-            shutil.rmtree(target)
-        target.mkdir(parents=True)
-        if candidate.is_dir():
-            for path in candidate.iterdir():
-                if path.suffix.lower() in (".exe", ".dll"):
-                    shutil.copy2(path, target / path.name)
-        else:
-            with zipfile.ZipFile(candidate) as zf:
-                for info in zf.infolist():
-                    name = Path(info.filename).name
-                    if name.lower().endswith((".exe", ".dll")):
-                        (target / name).write_bytes(zf.read(info))
-        log(f"whisper.cpp Vulkan: lấy từ {candidate}")
-    elif (target / "whisper-cli.exe").is_file():
-        log("whisper.cpp Vulkan: đã có")
-        return
-    else:
-        try:
-            resources.download_whisper_vulkan(_progress("whisper Vulkan"), bin_dir=TOOLS)
-            log("whisper.cpp Vulkan: đã tải từ release")
-        except Exception as exc:  # noqa: BLE001 — chưa có release nào kèm bản Vulkan
-            log(f"whisper.cpp Vulkan: bỏ qua ({exc})")
-            return
-    if not (target / "whisper-cli.exe").is_file():
-        shutil.rmtree(target, ignore_errors=True)
-        raise SystemExit("Gói whisper.cpp Vulkan không có whisper-cli.exe")
-
-
-def build_whisper_vulkan(ref: str = WHISPER_CPP_REF) -> Path:
-    """Build whisper-cli với backend Vulkan (liên kết tĩnh, CRT tĩnh) → build/whisper-vulkan-x64.zip.
-
-    Cần: git, CMake, Visual Studio (C++), Vulkan SDK (biến VULKAN_SDK). whisper.cpp không phát hành
-    bản Vulkan cho Windows nên ta tự build — CI chạy bước này rồi đính kèm file zip vào release.
-    """
-    if not os.environ.get("VULKAN_SDK"):
-        raise SystemExit("Chưa có Vulkan SDK (biến môi trường VULKAN_SDK). Tải tại https://vulkan.lunarg.com/sdk/home")
-    work = ROOT / "build" / "whisper-vulkan-src"
-    if not (work / ".git").is_dir():
-        shutil.rmtree(work, ignore_errors=True)
-        subprocess.run(["git", "clone", "--depth", "1", "--branch", ref,
-                        "https://github.com/ggml-org/whisper.cpp.git", str(work)], check=True)
-    out = work / "build-vulkan"
-    configure = [
-        "cmake", "-S", str(work), "-B", str(out),
-        "-DCMAKE_BUILD_TYPE=Release",
-        "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
-        "-DCMAKE_POLICY_DEFAULT_CMP0091=NEW",
-        "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded",  # CRT tĩnh: khỏi cần VC++ Redistributable
-        "-DBUILD_SHARED_LIBS=OFF",
-        "-DGGML_VULKAN=ON",
-        "-DGGML_NATIVE=OFF", "-DGGML_AVX2=ON", "-DGGML_FMA=ON", "-DGGML_F16C=ON",
-        "-DWHISPER_BUILD_TESTS=OFF", "-DWHISPER_BUILD_SERVER=OFF", "-DWHISPER_SDL2=OFF", "-DWHISPER_CURL=OFF",
-    ]
-    log("whisper.cpp Vulkan: cấu hình CMake…")
-    subprocess.run(configure, check=True)
-    log("whisper.cpp Vulkan: đang build (biên dịch shader Vulkan mất vài phút)…")
-    subprocess.run(["cmake", "--build", str(out), "--config", "Release", "--target", "whisper-cli",
-                    "-j", str(os.cpu_count() or 4)], check=True)
-    exe = next(out.rglob("whisper-cli.exe"), None)
-    if exe is None:
-        raise SystemExit("Build xong nhưng không thấy whisper-cli.exe")
-    files = [exe] + sorted(exe.parent.glob("*.dll"))
-    # kiểm tra chạy được (vulkan-1.dll đi kèm driver GPU / Vulkan SDK nên không đóng gói)
-    check = subprocess.run([str(exe), "--help"], capture_output=True, text=True, errors="replace")
-    if "--no-gpu" not in (check.stdout + check.stderr):
-        if check.returncode & 0xFFFFFFFF == 0xC0000135:  # thiếu DLL: máy build không có vulkan-1.dll
-            log("Cảnh báo: máy build thiếu vulkan-1.dll nên không chạy thử được whisper-cli")
-        else:
-            raise SystemExit(f"whisper-cli Vulkan không chạy được (mã {check.returncode & 0xFFFFFFFF:#x})")
-    VULKAN_ZIP.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(VULKAN_ZIP, "w", zipfile.ZIP_DEFLATED) as zf:
-        for path in files:
-            zf.write(path, path.name)
-        zf.writestr("VERSION.txt", f"whisper.cpp {ref} (GGML_VULKAN=ON)" + chr(10))
-    log(f"whisper.cpp Vulkan: {VULKAN_ZIP} ({VULKAN_ZIP.stat().st_size / 1e6:.0f} MB, {', '.join(p.name for p in files)})")
-    return VULKAN_ZIP
 
 
 # ------------------------------------------------------------------ phiên bản
@@ -290,7 +167,8 @@ def self_check(require: list[str]) -> None:
     report.unlink(missing_ok=True)
     log("Tự kiểm tra bản đóng gói…")
     # chạy trong thư mục tạm, không dùng PATH/thư mục công cụ của máy build để chắc exe tự đủ
-    env = {k: v for k, v in os.environ.items() if k not in ("REVIEWTRANS_EXTRA_BIN",)}
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("REVIEWTRANS_EXTRA_BIN", "REVIEWTRANS_DATA_DIR", "REVIEWTRANS_FUNASR_PYTHON")}
     env["PATH"] = os.environ.get("SystemRoot", r"C:\Windows") + r"\System32"
     fake_home = Path(tempfile.mkdtemp(prefix="rt_home_"))  # không cho dùng công cụ trong thư mục người dùng
     env["USERPROFILE"] = env["HOME"] = str(fake_home)
@@ -305,16 +183,67 @@ def self_check(require: list[str]) -> None:
     log(f"  libmpv: {data.get('libmpv')}")
     for tool, path in data.get("tools", {}).items():
         run = data.get("runs", {}).get(tool)
-        missing = "không có (tuỳ chọn)" if tool.startswith("whisper-") else "THIẾU"
+        missing = "THIẾU"
         log(f"  {tool}: {path or missing}" + (f" (chạy thử: mã {run})" if run is not None else ""))
+    if "funasr" in require:
+        asr = data.get("funasr", {})
+        log(f"  FunASR: PyTorch {asr.get('torch_version', '?')}, CUDA={asr.get('cuda_available')}, "
+            f"GPU={asr.get('gpu', '')}, models={asr.get('models_ready')}")
     if code != 0 or not data.get("ok"):
         raise SystemExit("Tự kiểm tra thất bại — xem build/selfcheck.json")
     log("  ✓ đủ thư viện và công cụ")
 
 
+def bundle_asr(source_runtime: Path | None = None, source_models: Path | None = None) -> None:
+    """Bundle only the independent runtime and public models, never user data."""
+    from reviewtrans.core.pipeline.funasr import MODEL_NAMES, funasr_models_dir, runtime_dir
+
+    source_runtime = source_runtime or runtime_dir()
+    source_models = source_models or funasr_models_dir()
+    if not (source_runtime / "python.exe").is_file() or not (source_runtime / "python311._pth").is_file():
+        raise SystemExit("Cần cài Python portable trong Tài nguyên → Paraformer trước khi đóng gói ASR.")
+    for name in MODEL_NAMES:
+        if not (source_models / name / ".reviewtrans-complete").is_file():
+            raise SystemExit(f"Chưa tải đủ model {name}.")
+    DIST.mkdir(parents=True, exist_ok=True)
+    for source, name in ((source_runtime, "asr-runtime"), (source_models, "asr-models")):
+        target = DIST / name
+        # Only replace generated payloads immediately inside this build's dist.
+        if target.resolve().parent != DIST.resolve() or source.resolve() == target.resolve():
+            raise SystemExit(f"Thư mục đóng gói ASR không hợp lệ: {target}")
+        log(f"Gom {name} từ {source}…")
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.copytree(source, target, ignore=shutil.ignore_patterns(
+            "__pycache__", "*.pyc", "Scripts", "pyvenv.cfg*", ".cache", "*.part", "~*"))
+    manifest = DIST / "asr-runtime/runtime-info.json"
+    if manifest.is_file():
+        info = json.loads(manifest.read_text(encoding="utf-8"))
+        # The build machine's GPU is not the recipient's GPU.
+        for key in ("gpu", "cuda_available", "python"):
+            info.pop(key, None)
+        manifest.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
+    (DIST / "portable.txt").write_text(
+        "ReviewTrans portable: dữ liệu và cache lưu trong data cạnh ReviewTrans.exe.\n", encoding="utf-8")
+    (DIST / "README-PORTABLE.txt").write_text(
+        "ReviewTrans Studio + Paraformer ASR\n\n"
+        "Giải nén nguyên thư mục vào ổ đĩa muốn dùng, rồi chạy ReviewTrans.exe.\n"
+        "Giữ asr-runtime, asr-models và _internal cạnh file exe khi chuyển thư mục.\n"
+        "Đã kèm Python, PyTorch/FunASR và 3 model; không cần cài Python riêng.\n"
+        "Bản CUDA cần driver NVIDIA tương thích CUDA 12.6; thiếu GPU thì dùng CPU.\n"
+        "Chọn Cài đặt > Nhận dạng chạy trên > Tự động hoặc CUDA để dùng GPU.\n"
+        "Dữ liệu và cache mới lưu trong data cạnh app.\n", encoding="utf-8")
+    log("  ✓ Python, PyTorch/FunASR và model đã nằm cạnh app; không sao chép settings/API key/project.")
+
+
 def make_zip(version: str) -> Path:
     RELEASE.mkdir(exist_ok=True)
-    target = RELEASE / f"ReviewTrans-{version}-portable.zip"
+    label = ""
+    manifest = DIST / "asr-runtime/runtime-info.json"
+    if manifest.is_file():
+        info = json.loads(manifest.read_text(encoding="utf-8"))
+        label = "-asr-cuda" if info.get("cuda_version") else "-asr-cpu"
+    target = RELEASE / f"ReviewTrans-{version}{label}-portable.zip"
     target.unlink(missing_ok=True)
     log(f"Nén {target.name}…")
     with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
@@ -367,26 +296,28 @@ def make_installer(version: str, required: bool) -> Path | None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("step", nargs="?", default="all",
-                        choices=["all", "tools", "app", "check", "zip", "installer", "whisper-vulkan"])
+                        choices=["all", "tools", "app", "check", "zip", "installer"])
     parser.add_argument("--version", default="", help="mặc định: APP_VERSION trong reviewtrans/__init__.py")
     parser.add_argument("--no-libmpv", action="store_true", help="không đóng gói libmpv (nhẹ hơn ~120 MB)")
-    parser.add_argument("--no-whisper", action="store_true", help="không đóng gói whisper.cpp")
-    parser.add_argument("--whisper-vulkan", default="", help="zip/thư mục whisper.cpp Vulkan để đóng gói kèm")
+
+
     parser.add_argument("--skip-installer", action="store_true")
     parser.add_argument("--skip-zip", action="store_true")
+    parser.add_argument("--bundle-asr", action="store_true", help="gộp Python portable + PyTorch/FunASR + 3 model vào bản phát hành")
     parser.add_argument("--require-installer", action="store_true", help="báo lỗi nếu không có Inno Setup (dùng trên CI)")
     args = parser.parse_args()
 
     version = args.version.strip().lstrip("v") or current_version()
-    require = ["ffmpeg", "ffprobe"] + ([] if args.no_whisper else ["whisper"]) + ([] if args.no_libmpv else ["libmpv"])
+    require = ["ffmpeg", "ffprobe"] + ([] if args.no_libmpv else ["libmpv"])
+    if args.bundle_asr:
+        require.append("funasr")
 
-    if args.step == "whisper-vulkan":
-        build_whisper_vulkan()
-        return
     if args.step in ("all", "tools"):
-        fetch_tools(with_libmpv=not args.no_libmpv, with_whisper=not args.no_whisper, vulkan_source=args.whisper_vulkan)
+        fetch_tools(with_libmpv=not args.no_libmpv)
     if args.step in ("all", "app"):
         build_app(version)
+    if args.bundle_asr and args.step in ("all", "app", "check", "zip", "installer"):
+        bundle_asr()
     if args.step in ("all", "check"):
         self_check(require)
     if args.step in ("all", "zip") and not args.skip_zip:

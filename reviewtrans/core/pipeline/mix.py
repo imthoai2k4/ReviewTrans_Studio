@@ -6,7 +6,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..models import Segment, VideoDoc
+from ..models import AudioSettings, Segment, VideoDoc
 from ..proc import atempo_chain, require_tool, run_checked
 from . import RunContext
 
@@ -24,7 +24,7 @@ class Clip:
 
 def plan_clips(doc: VideoDoc, segments: list[Segment]) -> list[Clip]:
     """Tính vị trí & hệ số tăng tốc của từng đoạn lồng tiếng (UI timeline cũng dùng)."""
-    ordered = sorted((s for s in segments if s.tts_file and s.tts_duration > 0), key=lambda s: s.start)
+    ordered = sorted((s for s in segments if not s.tts_error and s.tts_file and s.tts_duration > 0), key=lambda s: s.start)
     all_sorted = sorted(segments, key=lambda s: s.start)
     next_start: dict[int, float] = {}
     for current, following in zip(all_sorted, all_sorted[1:]):
@@ -35,11 +35,15 @@ def plan_clips(doc: VideoDoc, segments: list[Segment]) -> list[Clip]:
         slot_end = seg.end
         if audio.use_gap:
             slot_end = max(seg.end, next_start.get(id(seg), doc.duration or seg.end))
-        slot = max(0.1, slot_end - seg.start)
+        start = seg.start
+        if audio.fit_mode == "fit" and clips:
+            previous = clips[-1]
+            start = max(start, previous.start + previous.length)
+        slot = max(0.1, slot_end - start)
         tempo = 1.0
         if audio.fit_mode == "fit" and seg.tts_duration > slot:
             tempo = min(max(1.0, audio.max_speed), seg.tts_duration / slot)
-        clips.append(Clip(seg, seg.tts_file, seg.start, tempo, seg.tts_duration / tempo))
+        clips.append(Clip(seg, seg.tts_file, start, tempo, seg.tts_duration / tempo))
     return clips
 
 
@@ -57,6 +61,27 @@ def _merge_intervals(intervals: list[tuple[float, float]], gap: float = 0.35) ->
         else:
             merged.append([start, end])
     return [(a, b) for a, b in merged]
+
+
+def original_volume_filter(audio: AudioSettings, clips: list[Clip]) -> str:
+    """Âm lượng cố định hoặc giảm/tăng dần theo thời gian thực của các câu TTS."""
+    base = max(0, audio.original_volume) / 100.0
+    # Give the low end of the original-audio control a finer, quieter range.
+    if base < 1.0:
+        base = base ** 2
+    if audio.original_mode != "duck" or not clips:
+        return f"volume={base:.6f}"
+    remaining = max(0, min(100, audio.duck_volume)) / 100.0
+    attack = max(0.0, audio.duck_attack)
+    release = max(0.0, audio.duck_release)
+    envelopes = []
+    for start, end in _merge_intervals([(c.start, c.start + c.length) for c in clips]):
+        rise = f"clip((t-({start - attack:.6f}))/{attack:.6f},0,1)" if attack else f"gte(t,{start:.6f})"
+        fall = f"clip(({end + release:.6f}-t)/{release:.6f},0,1)" if release else f"lte(t,{end:.6f})"
+        envelopes.append(f"min({rise},{fall})")
+    # Các khoảng giảm giao nhau vẫn giữ đúng mức đã chọn, không nhân giảm nhiều lần.
+    envelope = f"min(1,{'+'.join(envelopes)})"
+    return f"volume='{base:.6f}*(1-{1 - remaining:.6f}*{envelope})':eval=frame"
 
 
 def build_dub_track(ctx: RunContext, doc: VideoDoc, clips: list[Clip]) -> Path | None:
@@ -140,7 +165,23 @@ def run_mix(ctx: RunContext, doc: VideoDoc, segments: list[Segment], target: Pat
     cache = ctx.store.cache_dir(doc.id)
     audio = doc.audio
     tracks = doc.tracks
+    use_original = doc.has_audio and tracks.original_audio and audio.original_mode != "mute"
+    if use_original:
+        mode = "tự giảm thêm khi có lồng tiếng" if audio.original_mode == "duck" else "giữ cố định suốt video"
+        ctx.log(f"Âm lượng video gốc: {audio.original_volume}% — {mode}.")
+    else:
+        ctx.log("Không dùng âm thanh video gốc trong bản trộn.")
     clips = plan_clips(doc, segments) if tracks.dub else []
+    for clip, following in zip(clips, clips[1:]):
+        overlap = clip.start + clip.length - following.start
+        if overlap > 0.05:
+            ctx.log(
+                f"CẢNH BÁO: voice câu #{clip.segment.id} chồng câu #{following.segment.id} {overlap:.2f}s "
+                f"ở tốc độ x{clip.tempo:.2f}. Hãy dịch gọn hoặc tạo lại voice; giữ đầy đủ tiếng, không cắt đuôi câu."
+            )
+    duration = max(doc.duration, 0.1, *(c.start + c.length for c in clips))
+    if duration > doc.duration + 0.05 and clips:
+        ctx.log(f"Lồng tiếng dài hơn video {duration - doc.duration:.2f}s. Khi xuất sẽ giữ khung hình cuối.")
     dub = build_dub_track(ctx, doc, clips) if clips else None
     ctx.progress(75, "Trộn âm thanh cuối")
 
@@ -148,17 +189,10 @@ def run_mix(ctx: RunContext, doc: VideoDoc, segments: list[Segment], target: Pat
     parts: list[str] = []
     labels: list[str] = []
     index = 0
-    duration = max(doc.duration, 0.1)
 
-    use_original = doc.has_audio and tracks.original_audio and audio.original_mode != "mute"
     if use_original:
         command += ["-i", doc.source_path]
-        chain = [f"volume={audio.original_volume / 100.0:.3f}"]
-        if audio.original_mode == "duck" and clips:
-            spans = _merge_intervals([(c.start, c.start + c.length) for c in clips])
-            expr = "+".join(f"between(t,{a:.2f},{b:.2f})" for a, b in spans)
-            chain.append(f"volume={audio.duck_volume / 100.0:.3f}:enable='{expr}'")
-        parts.append(f"[{index}:a]aresample=48000,{','.join(chain)}[orig]")
+        parts.append(f"[{index}:a]aresample=48000,{original_volume_filter(audio, clips)}[orig]")
         labels.append("[orig]")
         index += 1
     if dub is not None:

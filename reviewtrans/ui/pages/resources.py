@@ -3,35 +3,21 @@ from __future__ import annotations
 from PyQt6 import QtCore, QtWidgets
 
 from ...core.paths import fonts_dir, user_data_dir
+from ...core.pipeline.funasr import funasr_models_dir, install_funasr, models_ready, runtime_dir, runtime_info, runtime_python
 from ...core.pipeline.resources import (
-    KNOWN_WHISPER_MODELS,
     download_ffmpeg,
     download_libmpv,
-    download_whisper_binaries,
-    download_whisper_cuda,
-    download_whisper_vulkan,
-    downloaded_whisper_models,
-    ensure_whisper_model,
-    fetch_whisper_models,
     tool_status,
-    whisper_model_path,
 )
 from ...core.store import ProjectStore
 from ..jobs import run_background
 from ..state import AppState
 from ..theme import DANGER, SUCCESS, TEXT_DIM
-from ..widgets.common import confirm, error, hint, human_size, open_path, push_button, title_label
+from ..widgets.common import ComboBox, confirm, error, hint, human_size, open_path, push_button, title_label
 
-OPTIONAL = {"whisper-cuda", "whisper-vulkan"}
+OPTIONAL = set()
 TOOLS = [
     ("ffmpeg", "FFmpeg + FFprobe", "Bắt buộc: tách âm, trộn âm, xuất video.", download_ffmpeg),
-    ("whisper", "whisper.cpp (CPU)", "Nhận dạng giọng nói (ASR) offline, chạy mọi máy.", download_whisper_binaries),
-    ("whisper-cuda", "whisper.cpp CUDA (NVIDIA)",
-     "ASR bằng GPU NVIDIA (GTX 900 trở lên), nhanh gấp nhiều lần CPU. Gói ≈270 MB (RTX 40/50: ≈680 MB).",
-     download_whisper_cuda),
-    ("whisper-vulkan", "whisper.cpp Vulkan (AMD / Intel / NVIDIA)",
-     "ASR bằng mọi GPU có driver Vulkan. Bản do ReviewTrans tự build (whisper.cpp không phát hành cho Windows).",
-     download_whisper_vulkan),
     ("libmpv", "libmpv (player)", "Player mượt, seek chính xác, xem trước blur thật. Không có sẽ dùng Qt Multimedia.", download_libmpv),
 ]
 
@@ -44,6 +30,9 @@ class ResourcesPage(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.addWidget(title_label("Tài nguyên", "Tải và quản lý công cụ, model nhận dạng giọng nói, dung lượng cache."))
+        self.data_path_label = hint(f"Thư mục dữ liệu và tài nguyên: {user_data_dir()}")
+        self.data_path_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.data_path_label)
 
         tools_box = QtWidgets.QGroupBox("Công cụ")
         grid = QtWidgets.QGridLayout(tools_box)
@@ -51,6 +40,7 @@ class ResourcesPage(QtWidgets.QWidget):
         self.tool_progress: dict[str, QtWidgets.QProgressBar] = {}
         for row, (key, name, desc, fn) in enumerate(TOOLS):
             title = QtWidgets.QLabel(f"<b>{name}</b><br><span style='color:#9aa0a8'>{desc}</span>")
+            title.setWordWrap(True)
             status = QtWidgets.QLabel()
             status.setWordWrap(True)
             status.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -64,29 +54,38 @@ class ResourcesPage(QtWidgets.QWidget):
             grid.addWidget(button, row, 3)
             self.tool_labels[key] = status
             self.tool_progress[key] = progress
-        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(0, 3)
+        grid.setColumnStretch(1, 2)
         layout.addWidget(tools_box)
 
-        models_box = QtWidgets.QGroupBox("Model Whisper")
-        models_layout = QtWidgets.QVBoxLayout(models_box)
-        self.models = QtWidgets.QTableWidget(0, 3)
-        self.models.setHorizontalHeaderLabels(["Model", "Trạng thái", "Dung lượng"])
-        self.models.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
-        self.models.verticalHeader().setVisible(False)
-        self.models.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
-        self.models.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
-        models_layout.addWidget(self.models)
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(push_button("Lấy danh sách đầy đủ", self.fetch_models, "refresh"))
-        row.addWidget(push_button("Tải model đã chọn", self.download_model, "download", "Primary"))
-        row.addWidget(push_button("Xoá model đã chọn", self.delete_model, "delete"))
-        self.model_progress = QtWidgets.QProgressBar()
-        self.model_progress.setVisible(False)
-        row.addWidget(self.model_progress, 1)
-        models_layout.addLayout(row)
-        models_layout.addWidget(hint("Gợi ý: small/medium cho máy thường, large-v3-turbo cho độ chính xác cao. Bản -q5 nhẹ hơn."))
-        layout.addWidget(models_box, 1)
+        paraformer_box = QtWidgets.QGroupBox("Paraformer-zh · Nhận dạng tiếng Trung")
+        paraformer_layout = QtWidgets.QVBoxLayout(paraformer_box)
+        paraformer_layout.addWidget(hint(
+            "Paraformer-zh + FSMN-VAD + CT-Punc + CAM++: nhận dạng và chia lời thoại theo khoảng nghỉ, giọng nói. "
+            "Cài một lần trong app; cần Internet và tối thiểu 8 GiB trống cho CPU hoặc 16 GiB cho CUDA, "
+            "gồm dung lượng tạm. Không giữ cache tải pip. "
+            "Bản portable lưu bộ nhận dạng và model trong data cạnh app. "
+            "Tự động ưu tiên CUDA nếu driver NVIDIA phù hợp."
+        ))
+        self.paraformer_paths = QtWidgets.QLabel()
+        self.paraformer_paths.setWordWrap(True)
+        self.paraformer_paths.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        paraformer_layout.addWidget(self.paraformer_paths)
+        paraformer_row = QtWidgets.QHBoxLayout()
+        self.paraformer_status = QtWidgets.QLabel()
+        self.paraformer_status.setWordWrap(True)
+        paraformer_row.addWidget(self.paraformer_status, 1)
+        self.paraformer_device = ComboBox([("auto", "Tự động CPU / CUDA"), ("cuda", "NVIDIA CUDA"), ("cpu", "CPU")])
+        paraformer_row.addWidget(self.paraformer_device)
+        self.paraformer_button = push_button("Cài bộ nhận dạng + tải model", self.install_paraformer, "download")
+        paraformer_row.addWidget(self.paraformer_button)
+        paraformer_layout.addLayout(paraformer_row)
+        self.paraformer_progress = QtWidgets.QProgressBar()
+        self.paraformer_progress.setVisible(False)
+        paraformer_layout.addWidget(self.paraformer_progress)
+        layout.addWidget(paraformer_box)
 
+        layout.addStretch(1)
         storage = QtWidgets.QGroupBox("Lưu trữ")
         storage_layout = QtWidgets.QHBoxLayout(storage)
         self.cache_label = QtWidgets.QLabel()
@@ -97,7 +96,6 @@ class ResourcesPage(QtWidgets.QWidget):
         storage_layout.addWidget(push_button("Thư mục font", lambda: open_path(str(fonts_dir())), "folder"))
         layout.addWidget(storage)
 
-        self._all_models = list(KNOWN_WHISPER_MODELS)
         self.refresh()
 
     def showEvent(self, event) -> None:  # noqa: N802
@@ -105,6 +103,18 @@ class ResourcesPage(QtWidgets.QWidget):
         self.refresh()
 
     def refresh(self) -> None:
+        self.paraformer_paths.setText(
+            f"Nơi cài bộ nhận dạng: {runtime_dir()}\nNơi lưu model: {funasr_models_dir()}")
+        python = runtime_python()
+        info = runtime_info()
+        ready = python.is_file() and bool(info.get("torch_version")) and models_ready()
+        backend = f"CUDA {info['cuda_version']}" if info.get("cuda_version") else "CPU"
+        if info.get("cuda_available") and info.get("gpu"):
+            backend += f" · {info['gpu']}"
+        self.paraformer_status.setText(
+            f"Đã có 4 model · PyTorch {info.get('torch_version', '?')} · {backend}"
+            if ready else "Chưa cài đủ bộ nhận dạng / model")
+        self.paraformer_status.setStyleSheet(f"color: {SUCCESS if ready else TEXT_DIM};")
         status = tool_status()
         for key, _name, _desc, _fn in TOOLS:
             if key == "ffmpeg":
@@ -117,15 +127,27 @@ class ResourcesPage(QtWidgets.QWidget):
             optional = key in OPTIONAL and not ok
             label.setText(("✓ " if ok else "– " if optional else "✕ ") + (text if not optional else "Chưa tải (tuỳ chọn)"))
             label.setStyleSheet(f"color: {SUCCESS if ok else TEXT_DIM if optional else DANGER};")
-        downloaded = set(downloaded_whisper_models())
-        models = sorted(set(self._all_models) | downloaded)
-        self.models.setRowCount(len(models))
-        for row, model in enumerate(models):
-            path = whisper_model_path(model)
-            have = model in downloaded
-            for col, text in enumerate([model, "Đã tải" if have else "", human_size(path.stat().st_size) if have else ""]):
-                item = QtWidgets.QTableWidgetItem(text)
-                self.models.setItem(row, col, item)
+    def install_paraformer(self) -> None:
+        self.paraformer_button.setEnabled(False)
+        self.paraformer_device.setEnabled(False)
+        self.paraformer_progress.setVisible(True)
+        self.paraformer_progress.setValue(0)
+
+        def finish(message: str) -> None:
+            self.paraformer_button.setEnabled(True)
+            self.paraformer_device.setEnabled(True)
+            self.paraformer_progress.setVisible(False)
+            self.refresh()
+            if message:
+                error(self, message, "Cài Paraformer thất bại")
+
+        def progress(pct, message) -> None:
+            self.paraformer_progress.setValue(int(pct))
+            self.paraformer_status.setText(message)
+
+        device = self.paraformer_device.value()
+        run_background(lambda progress, stop: install_funasr(progress, stop, device=device),
+                       lambda _result: finish(""), finish, progress)
 
     def download_tool(self, key: str, fn) -> None:
         bar = self.tool_progress[key]
@@ -136,8 +158,6 @@ class ResourcesPage(QtWidgets.QWidget):
             bar.setVisible(False)
             self.refresh()
             note = " Khởi động lại ứng dụng để dùng player libmpv." if key == "libmpv" else ""
-            if key.startswith("whisper-"):
-                note = " Whisper sẽ tự dùng GPU (xem Cài đặt → Tăng tốc phần cứng)."
             self.window().statusBar().showMessage(f"Đã tải xong {key}.{note}", 8000)
 
         def fail(message: str) -> None:
@@ -146,44 +166,6 @@ class ResourcesPage(QtWidgets.QWidget):
 
         run_background(lambda progress, stop: fn(progress, stop), done, fail, lambda pct, _m: bar.setValue(int(pct)))
 
-    def fetch_models(self) -> None:
-        def done(models) -> None:
-            self._all_models = models
-            self.refresh()
-
-        run_background(lambda _p, _s: fetch_whisper_models(), done, lambda msg: error(self, msg))
-
-    def _selected_model(self) -> str:
-        row = self.models.currentRow()
-        item = self.models.item(row, 0) if row >= 0 else None
-        return item.text() if item else ""
-
-    def download_model(self) -> None:
-        model = self._selected_model()
-        if not model:
-            return
-        self.model_progress.setVisible(True)
-        self.model_progress.setValue(0)
-
-        def done(_path) -> None:
-            self.model_progress.setVisible(False)
-            self.refresh()
-
-        def fail(message: str) -> None:
-            self.model_progress.setVisible(False)
-            error(self, message)
-
-        run_background(
-            lambda progress, stop: ensure_whisper_model(model, progress, stop), done, fail,
-            lambda pct, _m: self.model_progress.setValue(int(pct)),
-        )
-
-    def delete_model(self) -> None:
-        model = self._selected_model()
-        path = whisper_model_path(model)
-        if model and path.exists() and confirm(self, "Xoá model", f"Xoá {path.name}?"):
-            path.unlink()
-            self.refresh()
 
     def compute_cache(self) -> None:
         store = self.state.store
